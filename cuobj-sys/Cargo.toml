@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name          = "cuobj-sys"
+version       = "0.1.0"
+edition       = "2021"
+description   = "Raw FFI bindings and C++ shims for the NVIDIA cuObj SDK (libcuobjclient + libcuobjserver)"
+license       = "Apache-2.0"
+repository    = "https://github.com/NVIDIA/cuobj-rs"
+documentation = "https://docs.rs/cuobj-sys"
+keywords      = ["rdma", "cuda", "nvidia", "ffi", "sys"]
+categories    = ["api-bindings", "external-ffi-bindings"]
+# The `links` key prevents other crates from also linking these libraries.
+links = "cuobj"
+
+[features]
+default = []
+client = []
+server = []
+
+[build-dependencies]
+cc = "1.0"

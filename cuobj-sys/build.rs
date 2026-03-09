@@ -1,0 +1,119 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Build script: compiles the cuObj C++ shims and links the native libraries.
+//!
+//! # Required environment variables
+//!
+//! | Variable            | Description                                         |
+//! |---------------------|-----------------------------------------------------|
+//! | `CUOBJ_ROOT_DIR` | Root of the cuObj / CUDA SDK installation.       |
+//!                         Defaults to `/usr/local/cuda` if unset.             |
+//! | `CUOBJ_LIB_DIR`  | Override for the directory containing               |
+//!                         `libcuobjclient.so`.  Checked before                |
+//!                         `CUOBJ_ROOT_DIR`.                                |
+
+fn main() {
+    let has_client = std::env::var("CARGO_FEATURE_CLIENT").is_ok();
+    let has_server = std::env::var("CARGO_FEATURE_SERVER").is_ok();
+
+    if !has_client && !has_server {
+        return;
+    }
+
+    // ── Locate include directory (needed by both shims) ────────────────────────
+
+    // Candidate CUDA / cuObj roots (in priority order).
+    let cuda_candidates = [
+        std::env::var("CUOBJ_ROOT_DIR").unwrap_or_default(),
+        "/usr/local/cuda-13.2/targets/x86_64-linux".into(),
+        "/usr/local/cuda/targets/x86_64-linux".into(),
+        "/usr/local/cuda".into(),
+    ];
+
+    // Find the first root whose include/cuobjclient.h exists.
+    let include_dir = cuda_candidates
+        .iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| std::path::PathBuf::from(p).join("include"))
+        .find(|p| p.join("cuobjclient.h").exists())
+        .unwrap_or_else(|| {
+            panic!(
+                "Cannot find cuobjclient.h. \
+                 Set CUOBJ_ROOT_DIR to the cuObj SDK root."
+            )
+        });
+
+    // ── Client shim ────────────────────────────────────────────────────────────
+
+    if has_client {
+        // Library search path for libcuobjclient.
+        let client_lib_dir = if let Ok(d) = std::env::var("CUOBJ_LIB_DIR") {
+            std::path::PathBuf::from(d)
+        } else {
+            cuda_candidates
+                .iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| std::path::PathBuf::from(p).join("lib"))
+                .find(|p| p.join("libcuobjclient.so").exists())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Cannot find libcuobjclient.so. \
+                         Set CUOBJ_LIB_DIR or CUOBJ_ROOT_DIR."
+                    )
+                })
+        };
+
+        cc::Build::new()
+            .cpp(true)
+            .std("c++17")
+            .file("src/wrapper.cpp")
+            .include(&include_dir)
+            .warnings(false)
+            .compile("cuobjclientwrapper");
+
+        println!("cargo:rustc-link-search=native={}", client_lib_dir.display());
+        println!("cargo:rustc-link-lib=dylib=cuobjclient");
+        println!("cargo:rerun-if-changed=src/wrapper.cpp");
+    }
+
+    // ── Server shim ────────────────────────────────────────────────────────────
+
+    if has_server {
+        // Library search path for libcuobjserver (installed to /usr/lib by default).
+        let server_lib_dirs: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib",
+            "/usr/local/lib",
+        ];
+        let server_lib_dir = server_lib_dirs
+            .iter()
+            .map(|p| std::path::PathBuf::from(p))
+            .find(|p| p.join("libcuobjserver.so").exists())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Cannot find libcuobjserver.so. \
+                     Install the cuObjServer package."
+                )
+            });
+
+        cc::Build::new()
+            .cpp(true)
+            .std("c++17")
+            .file("src/server_wrapper.cpp")
+            // cuobjserver.h is a system header (/usr/include); no extra -I needed.
+            // Include the CUDA path too so cuobjrdma.h can find cufile.h if needed.
+            .include(&include_dir)
+            .warnings(false)
+            .compile("cuobjserverwrapper");
+
+        println!("cargo:rustc-link-search=native={}", server_lib_dir.display());
+        println!("cargo:rustc-link-lib=dylib=cuobjserver");
+        println!("cargo:rerun-if-changed=src/server_wrapper.cpp");
+    }
+
+    // ── Re-run triggers ───────────────────────────────────────────────────────
+
+    println!("cargo:rerun-if-env-changed=CUOBJ_ROOT_DIR");
+    println!("cargo:rerun-if-env-changed=CUOBJ_LIB_DIR");
+}
