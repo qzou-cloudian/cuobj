@@ -11,7 +11,7 @@ fn main() {
     use cuobj::CuObjServer;
 
     // Bind to an RDMA-capable NIC. Adjust IP and port for your environment.
-    let ip   = std::env::var("RDMA_IP").unwrap_or_else(|_| "192.168.100.1".into());
+    let ip   = std::env::var("RDMA_IP").unwrap_or_else(|_| "10.50.132.250".into());
     let port = std::env::var("RDMA_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

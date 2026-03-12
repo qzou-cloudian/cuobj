@@ -32,7 +32,8 @@
 //!
 //! // High-level PUT handler — call from your HTTP server thread.
 //! let rdma_token = "<descriptor from x-amz-rdma-token header>";
-//! let data: Vec<u8> = server.receive_put("bucket/key", 4096, rdma_token)
+//! let remote_start = /* parse first hex field of rdma_token */ 0u64;
+//! let data: Vec<u8> = server.receive_put("bucket/key", remote_start, 4096, rdma_token)
 //!     .expect("RDMA PUT failed");
 //! println!("received {} bytes", data.len());
 //! ```
@@ -108,7 +109,7 @@ pub enum CuObjServerError {
 ///         │
 ///         └── Drop                     → cuobj_srv_destroy
 /// ```
-/// Internal helper: call `cuobj_srv_handle_put` given raw handles.
+
 fn do_handle_put(
     server_handle: *mut c_void,
     key:           &str,
@@ -315,10 +316,12 @@ impl CuObjServer {
     ///
     /// # Arguments
     ///
-    /// * `key`        — S3 object key.
-    /// * `size`       — expected transfer size in bytes.
-    /// * `rdma_token` — RDMA descriptor from the `x-amz-rdma-token` HTTP
-    ///                  request header.
+    /// * `key`          — S3 object key.
+    /// * `remote_start` — remote buffer start address (first field of the RDMA
+    ///                    token, i.e. the client's registered virtual address).
+    /// * `size`         — expected transfer size in bytes.
+    /// * `rdma_token`   — RDMA descriptor from the `x-amz-rdma-token` HTTP
+    ///                    request header.
     ///
     /// # Returns
     ///
@@ -326,12 +329,13 @@ impl CuObjServer {
     pub fn receive_put(
         &self,
         key: &str,
+        remote_start: u64,
         size: usize,
         rdma_token: &str,
     ) -> Result<Vec<u8>, CuObjServerError> {
         let buf     = self.alloc_buffer(size)?;
         let channel = self.alloc_channel();
-        let n       = self.handle_put(key, &buf, 0, size, rdma_token, &channel)?;
+        let n       = self.handle_put(key, &buf, remote_start, size, rdma_token, &channel)?;
         // Copy out of the RDMA-registered buffer before it is freed on drop.
         let data = buf.as_slice()[..n].to_vec();
         Ok(data)
@@ -345,10 +349,12 @@ impl CuObjServer {
     ///
     /// # Arguments
     ///
-    /// * `key`        — S3 object key.
-    /// * `data`       — object bytes to transfer to the client.
-    /// * `rdma_token` — RDMA descriptor from the `x-amz-rdma-token` HTTP
-    ///                  request header.
+    /// * `key`          — S3 object key.
+    /// * `remote_start` — remote buffer start address (first field of the RDMA
+    ///                    token, i.e. the client's registered virtual address).
+    /// * `data`         — object bytes to transfer to the client.
+    /// * `rdma_token`   — RDMA descriptor from the `x-amz-rdma-token` HTTP
+    ///                    request header.
     ///
     /// # Returns
     ///
@@ -356,6 +362,7 @@ impl CuObjServer {
     pub fn send_get(
         &self,
         key: &str,
+        remote_start: u64,
         data: &[u8],
         rdma_token: &str,
     ) -> Result<usize, CuObjServerError> {
@@ -363,7 +370,7 @@ impl CuObjServer {
         // Fill the RDMA-registered buffer with the object data.
         buf.as_mut_slice().copy_from_slice(data);
         let channel = self.alloc_channel();
-        let n       = self.handle_get(key, &buf, 0, data.len(), rdma_token, &channel)?;
+        let n       = self.handle_get(key, &buf, remote_start, data.len(), rdma_token, &channel)?;
         Ok(n)
         // `channel` and `buf` drop here → free channel ID and deregister buffer.
     }

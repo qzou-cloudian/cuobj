@@ -197,14 +197,16 @@ ssize_t cuobj_srv_handle_put(
 {
     CuObjSrvHandle *h   = static_cast<CuObjSrvHandle *>(handle);
     CuObjSrvBuffer *buf = static_cast<CuObjSrvBuffer *>(buf_handle);
-    return h->server->handlePutObject(
+    ssize_t n = h->server->handlePutObject(
         std::string(key),
         buf->rbuf,
         remote_buf_start,
         size,
         std::string(rdma_descr),
         channel,
-        /*local_offset=*/0);
+        /*local_offset=*/0,
+        /*wc_status_out=*/nullptr);
+    return n;
 }
 
 /**

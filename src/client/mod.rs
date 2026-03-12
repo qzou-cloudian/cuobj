@@ -164,14 +164,35 @@ impl OpType {
 /// Send this as the `x-amz-rdma-token` HTTP header value to the S3 server.
 /// The server decodes it to locate the client's registered memory region and
 /// perform the RDMA transfer.
-#[derive(Debug, Clone)]
-pub struct RdmaToken(Vec<u8>);
+///
+/// # Validity
+///
+/// The underlying SDK descriptor remains valid (and the RDMA operation can
+/// proceed) as long as this token is alive.  Dropping the token calls
+/// `cuMemObjPutRDMAToken`, which invalidates the descriptor.  Therefore the
+/// token **must not be dropped** until after the server has completed the
+/// RDMA operation.
+///
+/// # Ordering constraint
+///
+/// The token must be dropped before the [`CuObjClient`] that created it.
+pub struct RdmaToken {
+    /// SDK-allocated descriptor string; freed (and invalidated) on drop.
+    desc_str:      *mut c_char,
+    /// Borrowed client handle, used only for the `put` call in `Drop`.
+    client_handle: *mut c_void,
+}
+
+// SAFETY: the descriptor string is a plain C string with no thread affinity.
+unsafe impl Send for RdmaToken {}
+unsafe impl Sync for RdmaToken {}
 
 impl RdmaToken {
     /// View the raw descriptor bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        // SAFETY: desc_str is a valid, NUL-terminated C string for our lifetime.
+        unsafe { CStr::from_ptr(self.desc_str) }.to_bytes()
     }
 
     /// View the descriptor as a UTF-8 string slice.
@@ -180,38 +201,55 @@ impl RdmaToken {
     /// practice; the fallback returns `""` if the bytes are invalid UTF-8.
     #[inline]
     pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.0).unwrap_or("")
+        std::str::from_utf8(self.as_bytes()).unwrap_or("")
     }
 
-    /// Consume the token and return the underlying byte vector.
+    /// Copy the descriptor bytes and invalidate this token.
+    ///
+    /// The returned `Vec` is a plain copy; the SDK descriptor is freed
+    /// (via `Drop`) once `self` is consumed.
     #[inline]
     pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+        // Copy first; Drop runs after the function returns.
+        self.as_bytes().to_vec()
     }
 
     /// Length of the descriptor in bytes.
     #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.as_bytes().len()
     }
 
     /// Returns `true` if the descriptor is empty (should not happen in
     /// practice for a valid token).
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.as_bytes().is_empty()
+    }
+}
+
+impl Drop for RdmaToken {
+    fn drop(&mut self) {
+        // Releases the SDK allocation and invalidates the descriptor.
+        unsafe { cuobj_client_mem_put_rdma_token(self.client_handle, self.desc_str) };
+    }
+}
+
+impl std::fmt::Debug for RdmaToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RdmaToken").field(&self.as_str()).finish()
     }
 }
 
 impl std::fmt::Display for RdmaToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(String::from_utf8_lossy(&self.0).as_ref())
+        f.write_str(self.as_str())
     }
 }
 
 impl AsRef<[u8]> for RdmaToken {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        self.as_bytes()
     }
 }
 
@@ -448,10 +486,10 @@ impl CuObjClient {
                 reason: format!("cuMemObjGetRDMAToken returned {rc}"),
             });
         }
-        // Copy bytes before freeing the SDK-allocated string.
-        let bytes = unsafe { CStr::from_ptr(desc_str) }.to_bytes().to_vec();
-        unsafe { cuobj_client_mem_put_rdma_token(self.handle, desc_str) };
-        Ok(RdmaToken(bytes))
+        // Transfer ownership of the SDK-allocated string to RdmaToken.
+        // put_rdma_token is called in RdmaToken::drop, keeping the descriptor
+        // valid until the token is dropped.
+        Ok(RdmaToken { desc_str, client_handle: self.handle })
     }
 }
 

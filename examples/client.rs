@@ -35,11 +35,11 @@ fn main() {
 
     // Generate a PUT token covering the full buffer at offset 0.
     let put_tok = reg.put_token(0, reg.size()).expect("put_token failed");
-    println!("PUT token ({} bytes): {}...", put_tok.len(), &put_tok.as_str()[..put_tok.len().min(40)]);
+    println!("PUT token ({} bytes): {}", put_tok.len(), &put_tok.as_str());
 
     // Generate a GET token for the first 1 MiB.
     let get_tok = reg.get_token(0, 1024 * 1024).expect("get_token failed");
-    println!("GET token ({} bytes): {}...", get_tok.len(), &get_tok.as_str()[..get_tok.len().min(40)]);
+    println!("GET token ({} bytes): {}", get_tok.len(), &get_tok.as_str());
 
     // `reg` drops here → buffer is automatically deregistered.
     println!("buffer deregistered (on drop)");
