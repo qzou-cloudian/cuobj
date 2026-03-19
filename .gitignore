@@ -1,1 +1,5 @@
 /target/
+cuobj-sys/target/
+cuobj-sys/Cargo.lock
+*.log
+
