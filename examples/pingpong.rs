@@ -24,20 +24,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 
-/// Parse the remote buffer virtual address from an RDMA token string.
-///
-/// Token format: `<remote_vaddr_hex>:<size_hex>:<rkey_hex>:…`
-/// The first colon-delimited field is the absolute virtual address that must
-/// be passed as `remote_start` to [`CuObjServer::receive_put`] and
-/// [`CuObjServer::send_get`].
-fn token_remote_addr(token: &str) -> u64 {
-    token
-        .split(':')
-        .next()
-        .and_then(|s| u64::from_str_radix(s, 16).ok())
-        .unwrap_or(0)
-}
-
 // ── server ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "server")]
@@ -80,11 +66,9 @@ fn run_server() {
     reader.read_line(&mut line).expect("read ping token");
     let ping_token = line.trim().to_owned();
     line.clear();
-    let ping_remote_start = token_remote_addr(&ping_token);
-
     println!("[server] receiving {ping_size} bytes via RDMA PUT …");
     let ping_data = server
-        .receive_put("pingpong/ping", ping_remote_start, ping_size, &ping_token)
+        .receive_put("pingpong/ping", 0, ping_size, &ping_token)
         .expect("[server] receive_put failed");
 
     let ping_str = std::str::from_utf8(&ping_data[..4]).unwrap_or("????");
@@ -100,12 +84,10 @@ fn run_server() {
 
     reader.read_line(&mut line).expect("read pong token");
     let pong_token = line.trim().to_owned();
-    let pong_remote_start = token_remote_addr(&pong_token);
-
     let pong_payload: &[u8] = b"pong";
     println!("[server] sending {:?} via RDMA GET …", std::str::from_utf8(pong_payload).unwrap());
     server
-        .send_get("pingpong/pong", pong_remote_start, pong_payload, &pong_token)
+        .send_get("pingpong/pong", 0, pong_payload, &pong_token)
         .expect("[server] send_get failed");
 
     // Signal the client that both RDMA operations are complete.

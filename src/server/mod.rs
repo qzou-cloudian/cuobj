@@ -31,9 +31,10 @@
 //! assert!(server.is_connected());
 //!
 //! // High-level PUT handler — call from your HTTP server thread.
+//! // The RDMA token carries the client's buffer address; offset is usually 0
+//! // for a full-buffer transfer, or N bytes for a chunked streaming write.
 //! let rdma_token = "<descriptor from x-amz-rdma-token header>";
-//! let remote_start = /* parse first hex field of rdma_token */ 0u64;
-//! let data: Vec<u8> = server.receive_put("bucket/key", remote_start, 4096, rdma_token)
+//! let data: Vec<u8> = server.receive_put("bucket/key", 0, 4096, rdma_token)
 //!     .expect("RDMA PUT failed");
 //! println!("received {} bytes", data.len());
 //! ```
@@ -104,11 +105,27 @@ pub enum CuObjServerError {
 ///         │       ├── handle_put / handle_get  ← low-level RDMA
 ///         │       └── (drop)           → deregister + free
 ///         │
-///         ├── receive_put(key, size, token)  ← high-level: alloc + PUT + return Vec
-///         ├── send_get(key, data, token)     ← high-level: alloc + copy + GET
+///         ├── receive_put(key, offset, size, token)  ← high-level: alloc + PUT + return Vec
+///         ├── send_get(key, offset, data, token)     ← high-level: alloc + copy + GET
 ///         │
 ///         └── Drop                     → cuobj_srv_destroy
 /// ```
+
+/// Parse the client's buffer virtual address from the first colon-delimited
+/// hex field of an RDMA token.
+///
+/// Token format: `<remote_vaddr_hex>:<size_hex>:<rkey_hex>:…`
+///
+/// This address must be used as `remote_start` in the underlying C API.
+/// Adding a byte offset to it points to the correct chunk position within
+/// the client's registered buffer.
+fn token_remote_addr(token: &str) -> usize {
+    token
+        .split(':')
+        .next()
+        .and_then(|s| usize::from_str_radix(s, 16).ok())
+        .unwrap_or(0)
+}
 
 fn do_handle_put(
     server_handle: *mut c_void,
@@ -251,18 +268,18 @@ impl CuObjServer {
     ///
     /// `buf` must have been allocated with [`alloc_buffer`][Self::alloc_buffer].
     /// After a successful call, `buf.as_slice()[..size]` contains the data from
-    /// the client's registered buffer.
+    /// the client's registered buffer starting at `offset`.
     ///
     /// # Arguments
     ///
-    /// * `key`          — S3 object key (informational, passed to `handlePutObject`).
-    /// * `buf`          — server-side RDMA-registered buffer.
-    /// * `remote_start` — byte offset in the client's registered buffer to
-    ///                    read from (usually `0` when the token covers the full
-    ///                    buffer from offset 0).
-    /// * `size`         — number of bytes to transfer.
-    /// * `rdma_token`   — RDMA descriptor from the `x-amz-rdma-token` header.
-    /// * `channel`      — channel allocated via [`alloc_channel`][Self::alloc_channel].
+    /// * `key`       — S3 object key (informational, passed to `handlePutObject`).
+    /// * `buf`       — server-side RDMA-registered buffer.
+    /// * `offset`    — byte offset within the client's registered buffer to read
+    ///                 from.  Use `0` for a full-buffer transfer; use `N` for
+    ///                 chunked streaming to advance the read window by chunk size.
+    /// * `size`      — number of bytes to transfer.
+    /// * `rdma_token` — RDMA descriptor from the `x-amz-rdma-token` header.
+    /// * `channel`   — channel allocated via [`alloc_channel`][Self::alloc_channel].
     ///
     /// # Errors
     ///
@@ -272,12 +289,13 @@ impl CuObjServer {
         &self,
         key: &str,
         buf: &AllocatedBuffer<'_>,
-        remote_start: u64,
+        offset: u64,
         size: usize,
         rdma_token: &str,
         channel: &Channel<'_>,
     ) -> Result<usize, CuObjServerError> {
-        do_handle_put(self.handle, key, buf.buf, remote_start as usize, size, rdma_token, channel.id)
+        let remote_start = token_remote_addr(rdma_token) + offset as usize;
+        do_handle_put(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
     /// Perform an RDMA GET: RDMA_WRITE from `buf` into the client's buffer
@@ -288,7 +306,8 @@ impl CuObjServer {
     /// # Arguments
     ///
     /// Same as [`handle_put`][Self::handle_put], except the data flows in the
-    /// opposite direction (server → client).
+    /// opposite direction (server → client) and `offset` is the write position
+    /// within the client's buffer.
     ///
     /// # Errors
     ///
@@ -298,12 +317,13 @@ impl CuObjServer {
         &self,
         key: &str,
         buf: &AllocatedBuffer<'_>,
-        remote_start: u64,
+        offset: u64,
         size: usize,
         rdma_token: &str,
         channel: &Channel<'_>,
     ) -> Result<usize, CuObjServerError> {
-        do_handle_get(self.handle, key, buf.buf, remote_start as usize, size, rdma_token, channel.id)
+        let remote_start = token_remote_addr(rdma_token) + offset as usize;
+        do_handle_get(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
     // ── High-level convenience ───────────────────────────────────────────────
@@ -316,12 +336,14 @@ impl CuObjServer {
     ///
     /// # Arguments
     ///
-    /// * `key`          — S3 object key.
-    /// * `remote_start` — remote buffer start address (first field of the RDMA
-    ///                    token, i.e. the client's registered virtual address).
-    /// * `size`         — expected transfer size in bytes.
-    /// * `rdma_token`   — RDMA descriptor from the `x-amz-rdma-token` HTTP
-    ///                    request header.
+    /// * `key`        — S3 object key.
+    /// * `offset`     — byte offset within the client's registered buffer to
+    ///                  read from.  Use `0` for a full-buffer (non-chunked)
+    ///                  transfer.
+    /// * `size`       — expected transfer size in bytes.
+    /// * `rdma_token` — RDMA descriptor from the `x-amz-rdma-token` HTTP
+    ///                  request header.  The client's buffer base address is
+    ///                  parsed internally from this token.
     ///
     /// # Returns
     ///
@@ -329,13 +351,13 @@ impl CuObjServer {
     pub fn receive_put(
         &self,
         key: &str,
-        remote_start: u64,
+        offset: u64,
         size: usize,
         rdma_token: &str,
     ) -> Result<Vec<u8>, CuObjServerError> {
         let buf     = self.alloc_buffer(size)?;
         let channel = self.alloc_channel();
-        let n       = self.handle_put(key, &buf, remote_start, size, rdma_token, &channel)?;
+        let n       = self.handle_put(key, &buf, offset, size, rdma_token, &channel)?;
         // Copy out of the RDMA-registered buffer before it is freed on drop.
         let data = buf.as_slice()[..n].to_vec();
         Ok(data)
@@ -349,12 +371,13 @@ impl CuObjServer {
     ///
     /// # Arguments
     ///
-    /// * `key`          — S3 object key.
-    /// * `remote_start` — remote buffer start address (first field of the RDMA
-    ///                    token, i.e. the client's registered virtual address).
-    /// * `data`         — object bytes to transfer to the client.
-    /// * `rdma_token`   — RDMA descriptor from the `x-amz-rdma-token` HTTP
-    ///                    request header.
+    /// * `key`        — S3 object key.
+    /// * `offset`     — byte offset within the client's registered buffer to
+    ///                  write into.  Use `0` for a full-buffer transfer.
+    /// * `data`       — object bytes to transfer to the client.
+    /// * `rdma_token` — RDMA descriptor from the `x-amz-rdma-token` HTTP
+    ///                  request header.  The client's buffer base address is
+    ///                  parsed internally from this token.
     ///
     /// # Returns
     ///
@@ -362,7 +385,7 @@ impl CuObjServer {
     pub fn send_get(
         &self,
         key: &str,
-        remote_start: u64,
+        offset: u64,
         data: &[u8],
         rdma_token: &str,
     ) -> Result<usize, CuObjServerError> {
@@ -370,7 +393,7 @@ impl CuObjServer {
         // Fill the RDMA-registered buffer with the object data.
         buf.as_mut_slice().copy_from_slice(data);
         let channel = self.alloc_channel();
-        let n       = self.handle_get(key, &buf, remote_start, data.len(), rdma_token, &channel)?;
+        let n       = self.handle_get(key, &buf, offset, data.len(), rdma_token, &channel)?;
         Ok(n)
         // `channel` and `buf` drop here → free channel ID and deregister buffer.
     }
@@ -586,14 +609,16 @@ impl PersistentBuffer {
     /// Perform an RDMA_READ from the remote client buffer into this buffer.
     ///
     /// A fresh channel is allocated internally and freed when the operation
-    /// completes.
+    /// completes.  `offset` is the byte offset within the client's registered
+    /// buffer; use `0` for a full-buffer transfer.
     pub fn handle_put(
         &self,
-        key:          &str,
-        remote_start: usize,
-        size:         usize,
-        token:        &str,
+        key:    &str,
+        offset: usize,
+        size:   usize,
+        token:  &str,
     ) -> Result<usize, CuObjServerError> {
+        let remote_start = token_remote_addr(token) + offset;
         let ch_id = unsafe { cuobj_srv_alloc_channel(self.server.handle) };
         let result = do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id);
         unsafe { cuobj_srv_free_channel(self.server.handle, ch_id) };
@@ -603,14 +628,16 @@ impl PersistentBuffer {
     /// Perform an RDMA_WRITE from this buffer into the remote client buffer.
     ///
     /// A fresh channel is allocated internally and freed when the operation
-    /// completes.
+    /// completes.  `offset` is the byte offset within the client's registered
+    /// buffer to write into; use `0` for a full-buffer transfer.
     pub fn handle_get(
         &self,
-        key:          &str,
-        remote_start: usize,
-        size:         usize,
-        token:        &str,
+        key:    &str,
+        offset: usize,
+        size:   usize,
+        token:  &str,
     ) -> Result<usize, CuObjServerError> {
+        let remote_start = token_remote_addr(token) + offset;
         let ch_id = unsafe { cuobj_srv_alloc_channel(self.server.handle) };
         let result = do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id);
         unsafe { cuobj_srv_free_channel(self.server.handle, ch_id) };
