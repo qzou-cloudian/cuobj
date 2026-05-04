@@ -135,6 +135,17 @@ extern "C" {
     /// Returns `1` if the cuObjClient is connected to the RDMA subsystem,
     /// `0` otherwise.
     pub fn cuobj_client_is_connected(handle: *mut c_void) -> i32;
+
+    /// Set up telemetry for all cuObjClient instances.
+    /// `use_otel`=1 for OpenTelemetry backend; 0 for ostream.
+    /// `file_path` may be NULL (uses stdout) or a file path for ostream mode.
+    pub fn cuobj_client_setup_telemetry(use_otel: i32, file_path: *const c_char);
+
+    /// Shut down cuObjClient telemetry (reset to default output stream).
+    pub fn cuobj_client_shutdown_telemetry();
+
+    /// Set cuObjClient telemetry stream logging level flags.
+    pub fn cuobj_client_set_telem_flags(flags: u32);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,4 +287,13 @@ extern "C" {
         max_events: std::os::raw::c_int,
         channel:    u16,
     ) -> std::os::raw::c_int;
+
+    /// Set up telemetry for all cuObjServer instances.
+    pub fn cuobj_srv_setup_telemetry(use_otel: i32, file_path: *const c_char);
+
+    /// Shut down cuObjServer telemetry (reset to default output stream).
+    pub fn cuobj_srv_shutdown_telemetry();
+
+    /// Set cuObjServer telemetry stream logging level flags.
+    pub fn cuobj_srv_set_telem_flags(flags: u32);
 }

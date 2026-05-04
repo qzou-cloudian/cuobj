@@ -13,6 +13,13 @@
 //!                         `libcuobjclient.so`.  Checked before                |
 //!                         `CUOBJ_ROOT_DIR`.                                |
 
+fn fail(msg: &str) -> ! {
+    eprintln!("error: {msg}");
+    eprintln!("help: Set CUOBJ_ROOT_DIR to the cuObj SDK root directory.");
+    eprintln!("help: Set CUOBJ_LIB_DIR to override the library search path.");
+    std::process::exit(1);
+}
+
 fn main() {
     let has_client = std::env::var("CARGO_FEATURE_CLIENT").is_ok();
     let has_server = std::env::var("CARGO_FEATURE_SERVER").is_ok();
@@ -38,10 +45,7 @@ fn main() {
         .map(|p| std::path::PathBuf::from(p).join("include"))
         .find(|p| p.join("cuobjclient.h").exists())
         .unwrap_or_else(|| {
-            panic!(
-                "Cannot find cuobjclient.h. \
-                 Set CUOBJ_ROOT_DIR to the cuObj SDK root."
-            )
+            fail("Cannot find cuobjclient.h.");
         });
 
     // ── Client shim ────────────────────────────────────────────────────────────
@@ -57,10 +61,7 @@ fn main() {
                 .map(|p| std::path::PathBuf::from(p).join("lib"))
                 .find(|p| p.join("libcuobjclient.so").exists())
                 .unwrap_or_else(|| {
-                    panic!(
-                        "Cannot find libcuobjclient.so. \
-                         Set CUOBJ_LIB_DIR or CUOBJ_ROOT_DIR."
-                    )
+                    fail("Cannot find libcuobjclient.so.");
                 })
         };
 
@@ -91,10 +92,7 @@ fn main() {
             .map(|p| std::path::PathBuf::from(p))
             .find(|p| p.join("libcuobjserver.so").exists())
             .unwrap_or_else(|| {
-                panic!(
-                    "Cannot find libcuobjserver.so. \
-                     Install the cuObjServer package."
-                )
+                fail("Cannot find libcuobjserver.so.");
             });
 
         cc::Build::new()

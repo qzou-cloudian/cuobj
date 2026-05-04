@@ -34,7 +34,7 @@ fn main() {
     );
 
     // Low-level: allocate a channel for one concurrent operation.
-    let ch = server.alloc_channel();
+    let ch = server.alloc_channel().expect("alloc_channel failed");
     println!("channel id: {}", ch.id());
 
     // In a real server you would call:

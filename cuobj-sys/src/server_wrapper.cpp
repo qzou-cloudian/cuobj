@@ -19,6 +19,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <memory>
 #include <new>
 #include <string>
 
@@ -122,6 +124,8 @@ void *cuobj_srv_alloc_register(void *handle, size_t size)
     CuObjSrvBuffer *buf = new (std::nothrow) CuObjSrvBuffer();
     if (!buf) return nullptr;
 
+    // allocHostBuffer is spec'd to return ::malloc / posix_memalign memory;
+    // we pair it with ::free() in cuobj_srv_deregister_free.
     buf->host_ptr = h->server->allocHostBuffer(size);
     if (!buf->host_ptr) {
         delete buf;
@@ -198,11 +202,6 @@ ssize_t cuobj_srv_handle_put(
     CuObjSrvHandle *h   = static_cast<CuObjSrvHandle *>(handle);
     CuObjSrvBuffer *buf = static_cast<CuObjSrvBuffer *>(buf_handle);
     ibv_wc_status wc_status = IBV_WC_SUCCESS;
-    static int put_call_count = 0;
-    int call_no = ++put_call_count;
-    fprintf(stderr,
-        "[cuobj-shim] handlePutObject #%d key='%s' remote_start=0x%lx size=%zu desc='%s' ch=%u\n",
-        call_no, key, (unsigned long)remote_buf_start, size, rdma_descr, (unsigned)channel);
     ssize_t n = h->server->handlePutObject(
         std::string(key),
         buf->rbuf,
@@ -212,9 +211,6 @@ ssize_t cuobj_srv_handle_put(
         channel,
         /*local_offset=*/0,
         &wc_status);
-    fprintf(stderr,
-        "[cuobj-shim] handlePutObject #%d returned %zd, wc_status=%d (%s)\n",
-        call_no, n, (int)wc_status, ibv_wc_status_str(wc_status));
     return n;
 }
 
@@ -328,6 +324,44 @@ int cuobj_srv_poll(
 {
     CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
     return h->server->poll(events, max_events, channel);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telemetry (static methods on cuObjServer)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Set up the cuObjServer telemetry output stream.
+ *
+ * @param use_otel  1 = use OpenTelemetry backend, 0 = use ostream backend.
+ * @param file_path  Path to a log file for the ostream backend, or NULL for
+ *                   std::cout.  Ignored when use_otel is non-zero.
+ */
+void cuobj_srv_setup_telemetry(int use_otel, const char *file_path)
+{
+    if (use_otel) {
+        cuObjServer::setupTelemetry(true, nullptr);
+        return;
+    }
+    if (file_path && file_path[0] != '\0') {
+        static std::unique_ptr<std::ofstream> s_log;
+        s_log.reset(new std::ofstream(file_path, std::ios::app));
+        cuObjServer::setupTelemetry(false, s_log.get());
+    } else {
+        cuObjServer::setupTelemetry(false, &std::cout);
+    }
+}
+
+/** Shut down cuObjServer telemetry (reset to default output). */
+void cuobj_srv_shutdown_telemetry(void)
+{
+    cuObjServer::shutdownTelemetry();
+}
+
+/** Set cuObjServer telemetry logging flags. */
+void cuobj_srv_set_telem_flags(unsigned flags)
+{
+    cuObjServer::setTelemFlags(flags);
 }
 
 } // extern "C"

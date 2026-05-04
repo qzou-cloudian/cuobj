@@ -34,7 +34,7 @@
 
 use std::collections::HashSet;
 use std::ffi::{CStr, c_char, c_void};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use cuobj_sys::{
     CU_OBJ_SUCCESS, CUOBJ_GET, CUOBJ_MEMORY_CUDA_DEVICE, CUOBJ_MEMORY_CUDA_MANAGED,
@@ -43,6 +43,8 @@ use cuobj_sys::{
     cuobj_client_is_connected, cuobj_client_mem_get_descriptor,
     cuobj_client_mem_get_max_request_callback_size, cuobj_client_mem_get_rdma_token,
     cuobj_client_mem_put_descriptor, cuobj_client_mem_put_rdma_token,
+    cuobj_client_set_telem_flags, cuobj_client_setup_telemetry,
+    cuobj_client_shutdown_telemetry,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,34 +158,48 @@ impl OpType {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ClientHandle — shared ownership of the C++ cuObjClient
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Shared handle to the C++ `cuObjClient` object.
+///
+/// Both [`CuObjClient`] and any outstanding [`CuObjRdmaToken`]s hold an `Arc`
+/// to this handle so the C++ object is not destroyed until all tokens have been
+/// dropped — even if the `CuObjClient` itself is dropped first.
+struct ClientHandle(*mut c_void);
+
+// SAFETY: cuObjClient is internally thread-safe.
+unsafe impl Send for ClientHandle {}
+unsafe impl Sync for ClientHandle {}
+
+impl Drop for ClientHandle {
+    fn drop(&mut self) {
+        unsafe { cuobj_client_destroy(self.0) };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CuObjRdmaToken
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// An owned RDMA descriptor string produced by `cuMemObjGetRDMAToken`.
+/// Owned RDMA descriptor string produced by `cuMemObjGetRDMAToken`.
 ///
-/// Send this as the `x-amz-rdma-token` HTTP header value to the S3 server.
-/// The server decodes it to locate the client's registered memory region and
-/// perform the RDMA transfer.
+/// Wraps a C string allocated by the cuObj SDK.  The descriptor encodes the
+/// client's registered memory region so that an RDMA server can perform
+/// one-sided `RDMA_READ` (PUT) or `RDMA_WRITE` (GET) into it.  Send this as
+/// the `x-amz-rdma-token` HTTP header value to the S3 server.
 ///
-/// # Validity
+/// # Lifecycle
 ///
-/// The underlying SDK descriptor remains valid (and the RDMA operation can
-/// proceed) as long as this token is alive.  Dropping the token calls
-/// `cuMemObjPutRDMAToken`, which invalidates the descriptor.  Therefore the
-/// token **must not be dropped** until after the server has completed the
-/// RDMA operation.
+/// The underlying descriptor remains valid as long as this token is alive.
+/// Dropping the token calls `cuMemObjPutRDMAToken` and invalidates the
+/// descriptor, so the token **must not be dropped** until the server has
+/// completed the RDMA operation.
 ///
-/// # Ordering constraint
-///
-/// The token must be dropped before the [`CuObjClient`] that created it.
-/// Opaque RDMA descriptor returned by the cuObject client SDK.
-///
-/// Wraps a C string (`char *`) allocated by the cuObj SDK.  The descriptor is
-/// sent as the value of the `x-amz-rdma-token` HTTP header so that an RDMA
-/// server can perform a one-sided `RDMA_READ` or `RDMA_WRITE` directly into
-/// the registered client buffer.
-///
-/// The descriptor is freed via `cuMemObjPutRDMAToken` on drop.
+/// The token holds an `Arc` to the shared C++ client handle, preventing the
+/// C++ object from being destroyed until all tokens are dropped.  Dropping the
+/// [`CuObjClient`] first is safe: the C++ destruction is deferred until the
+/// last token finishes.
 ///
 /// # Naming
 ///
@@ -193,12 +209,13 @@ impl OpType {
 /// RAII handle; the other is a parsed Rust struct.
 pub struct CuObjRdmaToken {
     /// SDK-allocated descriptor string; freed (and invalidated) on drop.
-    desc_str:      *mut c_char,
-    /// Borrowed client handle, used only for the `put` call in `Drop`.
-    client_handle: *mut c_void,
+    desc_str: *mut c_char,
+    /// Keeps the C++ client alive until this token is dropped.
+    _handle:  Arc<ClientHandle>,
 }
 
 // SAFETY: the descriptor string is a plain C string with no thread affinity.
+// ClientHandle is Send + Sync.
 unsafe impl Send for CuObjRdmaToken {}
 unsafe impl Sync for CuObjRdmaToken {}
 
@@ -246,7 +263,8 @@ impl CuObjRdmaToken {
 impl Drop for CuObjRdmaToken {
     fn drop(&mut self) {
         // Releases the SDK allocation and invalidates the descriptor.
-        unsafe { cuobj_client_mem_put_rdma_token(self.client_handle, self.desc_str) };
+        // _handle.0 is the raw C++ client pointer, kept alive by the Arc.
+        unsafe { cuobj_client_mem_put_rdma_token(self._handle.0, self.desc_str) };
     }
 }
 
@@ -285,6 +303,9 @@ impl AsRef<str> for CuObjRdmaToken {
 /// `CuObjClient` is `Send + Sync`.  The cuObj library provides its own
 /// internal locking; the registration tracking uses a `std::sync::Mutex`.
 ///
+/// This type is not [`Clone`] — cloning would duplicate the ownership of the
+/// underlying C++ handle and lead to a double-free.
+///
 /// # Lifecycle
 ///
 /// ```text
@@ -296,10 +317,13 @@ impl AsRef<str> for CuObjRdmaToken {
 ///         │
 ///         ├── deregister(ptr)      ← cuMemObjPutDescriptor
 ///         │
-///         └── Drop                ← cuobj_client_destroy()
+///         └── Drop                ← deregister outstanding → destroy C++ object
 /// ```
+///
+/// The C++ object is not destroyed until all [`CuObjRdmaToken`]s created by
+/// this client have also been dropped.
 pub struct CuObjClient {
-    handle: *mut c_void,
+    handle:     Arc<ClientHandle>,
     /// Base addresses of currently registered memory regions.
     registered: Mutex<HashSet<usize>>,
 }
@@ -316,19 +340,19 @@ impl CuObjClient {
     /// Returns [`CuObjClientError::CreateFailed`] if the RDMA subsystem is
     /// unavailable or the library is not installed.
     pub fn new() -> Result<Self, CuObjClientError> {
-        let handle = unsafe { cuobj_client_create() };
-        if handle.is_null() {
+        let raw = unsafe { cuobj_client_create() };
+        if raw.is_null() {
             return Err(CuObjClientError::CreateFailed);
         }
         Ok(Self {
-            handle,
+            handle: Arc::new(ClientHandle(raw)),
             registered: Mutex::new(HashSet::new()),
         })
     }
 
     /// Returns `true` if the client is connected to the RDMA subsystem.
     pub fn is_connected(&self) -> bool {
-        unsafe { cuobj_client_is_connected(self.handle) != 0 }
+        unsafe { cuobj_client_is_connected(self.handle.0) != 0 }
     }
 
     /// Classify the memory type of `ptr` using `cuObjClient::getMemoryType`.
@@ -373,7 +397,7 @@ impl CuObjClient {
             reg.insert(addr);
         }
         let rc = unsafe {
-            cuobj_client_mem_get_descriptor(self.handle, ptr as *mut c_void, size)
+            cuobj_client_mem_get_descriptor(self.handle.0,ptr as *mut c_void, size)
         };
         if rc != CU_OBJ_SUCCESS {
             self.registered.lock().unwrap().remove(&addr);
@@ -396,7 +420,7 @@ impl CuObjClient {
             return Ok(());
         }
         let rc = unsafe {
-            cuobj_client_mem_put_descriptor(self.handle, ptr as *mut c_void)
+            cuobj_client_mem_put_descriptor(self.handle.0,ptr as *mut c_void)
         };
         if rc != CU_OBJ_SUCCESS {
             return Err(CuObjClientError::DeregistrationFailed {
@@ -442,15 +466,15 @@ impl CuObjClient {
 
     /// Return the maximum single-callback transfer size for the buffer at `ptr`.
     ///
-    /// Returns `0` if the query fails (e.g., `ptr` is not registered).
-    pub fn max_transfer_size(&self, ptr: *const u8) -> usize {
+    /// Returns `None` if the query fails (e.g., `ptr` is not registered).
+    pub fn max_transfer_size(&self, ptr: *const u8) -> Option<usize> {
         let v = unsafe {
             cuobj_client_mem_get_max_request_callback_size(
-                self.handle,
+                self.handle.0,
                 ptr as *mut c_void,
             )
         };
-        if v < 0 { 0 } else { v as usize }
+        if v < 0 { None } else { Some(v as usize) }
     }
 
     // ── RAII convenience ─────────────────────────────────────────────────────
@@ -474,6 +498,38 @@ impl CuObjClient {
         })
     }
 
+    // ── Telemetry (static / library-wide) ────────────────────────────────────
+
+    /// Set up the telemetry output stream for all `cuObjClient` instances in
+    /// this process.
+    ///
+    /// * `use_otel` — `true` for OpenTelemetry backend, `false` for ostream.
+    /// * `log_file` — optional file path for ostream mode; `None` uses stdout.
+    pub fn setup_telemetry(use_otel: bool, log_file: Option<&str>) {
+        let file_path = log_file.map(|s| std::ffi::CString::new(s).unwrap());
+        let file_ptr = file_path
+            .as_ref()
+            .map(|cs| cs.as_ptr())
+            .unwrap_or(std::ptr::null());
+        unsafe {
+            cuobj_client_setup_telemetry(use_otel as i32, file_ptr);
+        }
+    }
+
+    /// Shut down telemetry for all `cuObjClient` instances (reset to default
+    /// output stream).
+    pub fn shutdown_telemetry() {
+        unsafe { cuobj_client_shutdown_telemetry() };
+    }
+
+    /// Set telemetry logging flags for all `cuObjClient` instances.
+    ///
+    /// See `cuobjtelem.h` for available flags (`CUOBJ_LOG_PATH_INFO`,
+    /// `CUOBJ_LOG_PATH_DEBUG`, `CUOBJ_LOG_PATH_ERROR`).
+    pub fn set_telem_flags(flags: u32) {
+        unsafe { cuobj_client_set_telem_flags(flags) };
+    }
+
     // ── Internal ─────────────────────────────────────────────────────────────
 
     fn rdma_token_inner(
@@ -486,7 +542,7 @@ impl CuObjClient {
         let mut desc_str: *mut c_char = std::ptr::null_mut();
         let rc = unsafe {
             cuobj_client_mem_get_rdma_token(
-                self.handle,
+                self.handle.0,
                 ptr as *mut c_void,
                 size,
                 offset,
@@ -501,10 +557,7 @@ impl CuObjClient {
                 reason: format!("cuMemObjGetRDMAToken returned {rc}"),
             });
         }
-        // Transfer ownership of the SDK-allocated string to CuObjRdmaToken.
-        // put_rdma_token is called in CuObjRdmaToken::drop, keeping the descriptor
-        // valid until the token is dropped.
-        Ok(CuObjRdmaToken { desc_str, client_handle: self.handle })
+        Ok(CuObjRdmaToken { desc_str, _handle: Arc::clone(&self.handle) })
     }
 }
 
@@ -520,10 +573,24 @@ impl Drop for CuObjClient {
             .collect();
         for addr in ptrs {
             unsafe {
-                cuobj_client_mem_put_descriptor(self.handle, addr as *mut c_void);
+                cuobj_client_mem_put_descriptor(self.handle.0,addr as *mut c_void);
             }
         }
-        unsafe { cuobj_client_destroy(self.handle) };
+        // handle (Arc<ClientHandle>) dropped implicitly here.
+        // ClientHandle::drop calls cuobj_client_destroy when the last Arc is
+        // gone — safe even if CuObjRdmaToken clones are still outstanding.
+    }
+}
+
+impl std::fmt::Debug for CuObjClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CuObjClient")
+            .field("handle", &self.handle.0)
+            .field(
+                "registrations",
+                &self.registered.lock().map(|g| g.len()).unwrap_or(0),
+            )
+            .finish()
     }
 }
 
@@ -582,12 +649,25 @@ impl<'a> RegisteredBuffer<'a> {
     /// Generate a PUT RDMA descriptor covering `len` bytes at `offset` within
     /// the registered buffer.
     ///
-    /// `offset + len` must not exceed [`Self::size`].
+    /// # Errors
+    ///
+    /// Returns [`CuObjClientError::TokenFailed`] if `offset + len` exceeds
+    /// [`Self::size`].
     pub fn put_token(
         &self,
         offset: usize,
         len: usize,
     ) -> Result<CuObjRdmaToken, CuObjClientError> {
+        if offset.saturating_add(len) > self.size {
+            return Err(CuObjClientError::TokenFailed {
+                op: OpType::Put,
+                offset,
+                reason: format!(
+                    "offset({offset}) + len({len}) exceeds buffer size({})",
+                    self.size
+                ),
+            });
+        }
         self.client.put_token(self.ptr, len, offset)
     }
 
@@ -598,13 +678,23 @@ impl<'a> RegisteredBuffer<'a> {
         offset: usize,
         len: usize,
     ) -> Result<CuObjRdmaToken, CuObjClientError> {
+        if offset.saturating_add(len) > self.size {
+            return Err(CuObjClientError::TokenFailed {
+                op: OpType::Get,
+                offset,
+                reason: format!(
+                    "offset({offset}) + len({len}) exceeds buffer size({})",
+                    self.size
+                ),
+            });
+        }
         self.client.get_token(self.ptr, len, offset)
     }
 
     /// Maximum single-callback RDMA transfer size for this buffer.
     ///
-    /// Returns `0` if the query fails.
-    pub fn max_transfer_size(&self) -> usize {
+    /// Returns `None` if the query fails.
+    pub fn max_transfer_size(&self) -> Option<usize> {
         self.client.max_transfer_size(self.ptr)
     }
 }

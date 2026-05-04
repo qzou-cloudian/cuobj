@@ -31,7 +31,7 @@ fn main() {
         reg.size() / (1024 * 1024),
         reg.ptr()
     );
-    println!("max transfer size: {} bytes", reg.max_transfer_size());
+    println!("max transfer size: {:?}", reg.max_transfer_size());
 
     // Generate a PUT token covering the full buffer at offset 0.
     let put_tok = reg.put_token(0, reg.size()).expect("put_token failed");

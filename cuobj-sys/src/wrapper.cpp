@@ -13,6 +13,8 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <fstream>
+#include <memory>
 #include <new>
 
 extern "C" {
@@ -146,6 +148,44 @@ int cuobj_client_is_connected(void *handle)
 {
     CuObjClientWrapper *w = static_cast<CuObjClientWrapper *>(handle);
     return w->client->isConnected() ? 1 : 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telemetry (static methods on cuObjClient)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Set up the cuObjClient telemetry output stream.
+ *
+ * @param use_otel  1 = use OpenTelemetry backend, 0 = use ostream backend.
+ * @param file_path  Path to a log file for the ostream backend, or NULL for
+ *                   std::cout.  Ignored when use_otel is non-zero.
+ */
+void cuobj_client_setup_telemetry(int use_otel, const char *file_path)
+{
+    if (use_otel) {
+        cuObjClient::setupTelemetry(true, nullptr);
+        return;
+    }
+    if (file_path && file_path[0] != '\0') {
+        static std::unique_ptr<std::ofstream> s_log;
+        s_log.reset(new std::ofstream(file_path, std::ios::app));
+        cuObjClient::setupTelemetry(false, s_log.get());
+    } else {
+        cuObjClient::setupTelemetry(false, &std::cout);
+    }
+}
+
+/** Shut down cuObjClient telemetry (reset to default output). */
+void cuobj_client_shutdown_telemetry(void)
+{
+    cuObjClient::shutdownTelemetry();
+}
+
+/** Set cuObjClient telemetry logging flags. */
+void cuobj_client_set_telem_flags(unsigned flags)
+{
+    cuObjClient::setTelemFlags(flags);
 }
 
 } // extern "C"

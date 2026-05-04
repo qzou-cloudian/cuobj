@@ -21,13 +21,12 @@
 //!   RDMA_PORT  RDMA port for the server          (default: 4421)
 //!   CTRL_PORT  TCP control-plane port            (default: 7070)
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
-
 // ── server ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "server")]
 fn run_server() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
     use cuobj::CuObjServer;
 
     let rdma_ip = std::env::var("RDMA_IP").unwrap_or_else(|_| "10.50.132.250".into());
@@ -99,6 +98,8 @@ fn run_server() {
 
 #[cfg(feature = "client")]
 fn run_client(server_ip: &str) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
     use cuobj::CuObjClient;
 
     let ctrl_port: u16 = std::env::var("CTRL_PORT")
@@ -186,9 +187,11 @@ fn main() {
             eprintln!("Recompile with `--features server` to enable the server mode.");
         }
         Some("client") => {
-            let server_ip = args.get(2).map(String::as_str).unwrap_or("127.0.0.1");
             #[cfg(feature = "client")]
-            run_client(server_ip);
+            {
+                let server_ip = args.get(2).map(String::as_str).unwrap_or("127.0.0.1");
+                run_client(server_ip);
+            }
             #[cfg(not(feature = "client"))]
             eprintln!("Recompile with `--features client` to enable the client mode.");
         }

@@ -49,6 +49,7 @@ use cuobj_sys::{
     cuobj_srv_create, cuobj_srv_deregister_free, cuobj_srv_destroy, cuobj_srv_free_channel,
     cuobj_srv_handle_get, cuobj_srv_handle_get_async, cuobj_srv_handle_put,
     cuobj_srv_handle_put_async, cuobj_srv_is_connected, cuobj_srv_poll,
+    cuobj_srv_set_telem_flags, cuobj_srv_setup_telemetry, cuobj_srv_shutdown_telemetry,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +84,10 @@ pub enum CuObjServerError {
     #[error("channel allocation failed: no channels available (server returned INVALID_CHANNEL_ID)")]
     ChannelAllocFailed,
 
+    /// The RDMA token could not be parsed.
+    #[error("failed to parse RDMA token: {0}")]
+    InvalidToken(String),
+
     /// A NUL byte appeared in a string argument.
     #[error("argument contains interior NUL byte: {0}")]
     NulError(#[from] std::ffi::NulError),
@@ -93,6 +98,9 @@ pub enum CuObjServerError {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Safe wrapper around the `cuObjServer` C++ object.
+///
+/// This type is not [`Clone`] — cloning would duplicate ownership of the
+/// underlying C++ handle and lead to a double-free.
 ///
 /// # Thread safety
 ///
@@ -125,23 +133,26 @@ pub enum CuObjServerError {
 /// This address must be used as `remote_start` in the underlying C API.
 /// Adding a byte offset to it points to the correct chunk position within
 /// the client's registered buffer.
-fn token_remote_addr(token: &str) -> usize {
+fn token_remote_addr(token: &str) -> Result<usize, CuObjServerError> {
     token
         .split(':')
         .next()
         .and_then(|s| usize::from_str_radix(s, 16).ok())
-        .unwrap_or(0)
+        .ok_or_else(|| CuObjServerError::InvalidToken(
+            format!("remote address field missing or unparseable in token: {token}")
+        ))
 }
 
 /// Extract the client buffer size (second colon-separated hex field) from a
-/// cuObj RDMA token.  Returns `usize::MAX` if the field is missing or
-/// unparseable, so callers that `min()` against it are unaffected.
-fn token_client_size(token: &str) -> usize {
+/// cuObj RDMA token.
+fn token_client_size(token: &str) -> Result<usize, CuObjServerError> {
     token
         .split(':')
         .nth(1)
         .and_then(|s| usize::from_str_radix(s, 16).ok())
-        .unwrap_or(usize::MAX)
+        .ok_or_else(|| CuObjServerError::InvalidToken(
+            format!("client size field missing or unparseable in token: {token}")
+        ))
 }
 
 /// Internal helper: call `cuobj_srv_handle_put` given raw handles.
@@ -171,6 +182,21 @@ fn do_handle_put(
         return Err(CuObjServerError::PutFailed { key: key.to_owned(), transferred: n });
     }
     Ok(n as usize)
+}
+
+/// On-drop guard that frees a channel allocated for a single-operation scope.
+///
+/// Used in `PersistentBuffer` when `channel_id` is `None` to ensure the
+/// auto-allocated channel is freed even if the inner operation panics.
+struct ScopedChannel {
+    server_handle: *mut c_void,
+    id: u16,
+}
+
+impl Drop for ScopedChannel {
+    fn drop(&mut self) {
+        unsafe { cuobj_srv_free_channel(self.server_handle, self.id) };
+    }
 }
 
 /// Internal helper: call `cuobj_srv_handle_get` given raw handles.
@@ -240,6 +266,35 @@ impl CuObjServer {
     /// Returns `true` if the server is connected to the RDMA fabric.
     pub fn is_connected(&self) -> bool {
         unsafe { cuobj_srv_is_connected(self.handle) != 0 }
+    }
+
+    // ── Telemetry (static / library-wide) ────────────────────────────────────
+
+    /// Set up the telemetry output stream for all `cuObjServer` instances in
+    /// this process.
+    ///
+    /// * `use_otel` — `true` for OpenTelemetry backend, `false` for ostream.
+    /// * `log_file` — optional file path for ostream mode; `None` uses stdout.
+    pub fn setup_telemetry(use_otel: bool, log_file: Option<&str>) {
+        let file_path = log_file.map(|s| std::ffi::CString::new(s).unwrap());
+        let file_ptr = file_path
+            .as_ref()
+            .map(|cs| cs.as_ptr())
+            .unwrap_or(std::ptr::null());
+        unsafe {
+            cuobj_srv_setup_telemetry(use_otel as i32, file_ptr);
+        }
+    }
+
+    /// Shut down telemetry for all `cuObjServer` instances (reset to default
+    /// output stream).
+    pub fn shutdown_telemetry() {
+        unsafe { cuobj_srv_shutdown_telemetry() };
+    }
+
+    /// Set telemetry logging flags for all `cuObjServer` instances.
+    pub fn set_telem_flags(flags: u32) {
+        unsafe { cuobj_srv_set_telem_flags(flags) };
     }
 
     // ── Channel management ───────────────────────────────────────────────────
@@ -350,8 +405,12 @@ impl CuObjServer {
         rdma_token: &str,
         channel: &Channel<'_>,
     ) -> Result<usize, CuObjServerError> {
-        let remote_start = token_remote_addr(rdma_token) + offset as usize;
-        let size = size.min(token_client_size(rdma_token).saturating_sub(offset as usize));
+        let remote_start = token_remote_addr(rdma_token)? + offset as usize;
+        let max_size = token_client_size(rdma_token)?.saturating_sub(offset as usize);
+        if size > max_size {
+            eprintln!("[cuobj] handle_put: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
+        }
+        let size = size.min(max_size);
         do_handle_put(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
@@ -379,8 +438,12 @@ impl CuObjServer {
         rdma_token: &str,
         channel: &Channel<'_>,
     ) -> Result<usize, CuObjServerError> {
-        let remote_start = token_remote_addr(rdma_token) + offset as usize;
-        let size = size.min(token_client_size(rdma_token).saturating_sub(offset as usize));
+        let remote_start = token_remote_addr(rdma_token)? + offset as usize;
+        let max_size = token_client_size(rdma_token)?.saturating_sub(offset as usize);
+        if size > max_size {
+            eprintln!("[cuobj] handle_get: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
+        }
+        let size = size.min(max_size);
         do_handle_get(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
@@ -416,8 +479,9 @@ impl CuObjServer {
         let buf     = self.alloc_buffer(size)?;
         let channel = self.alloc_channel()?;
         let n       = self.handle_put(key, &buf, offset, size, rdma_token, &channel)?;
-        // Copy out of the RDMA-registered buffer before it is freed on drop.
-        let data = buf.as_slice()[..n].to_vec();
+        // Defend against the C++ layer returning more bytes than the buffer size.
+        let len     = n.min(buf.len());
+        let data = buf.as_slice()[..len].to_vec();
         Ok(data)
         // `channel` and `buf` drop here → free channel ID and deregister buffer.
     }
@@ -448,8 +512,15 @@ impl CuObjServer {
         rdma_token: &str,
     ) -> Result<usize, CuObjServerError> {
         let mut buf = self.alloc_buffer(data.len())?;
+        let buf_len = buf.len();
+        if buf_len < data.len() {
+            return Err(CuObjServerError::AllocError(format!(
+                "allocated buffer too small: got {buf_len}, expected >= {}",
+                data.len()
+            )));
+        }
         // Fill the RDMA-registered buffer with the object data.
-        buf.as_mut_slice().copy_from_slice(data);
+        buf.as_mut_slice()[..data.len()].copy_from_slice(data);
         let channel = self.alloc_channel()?;
         let n       = self.handle_get(key, &buf, offset, data.len(), rdma_token, &channel)?;
         Ok(n)
@@ -460,6 +531,14 @@ impl CuObjServer {
 impl Drop for CuObjServer {
     fn drop(&mut self) {
         unsafe { cuobj_srv_destroy(self.handle) };
+    }
+}
+
+impl std::fmt::Debug for CuObjServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CuObjServer")
+            .field("handle", &self.handle)
+            .finish()
     }
 }
 
@@ -497,6 +576,12 @@ impl Drop for Channel<'_> {
         if self.id != u16::MAX {
             unsafe { cuobj_srv_free_channel(self.server_handle, self.id) };
         }
+    }
+}
+
+impl std::fmt::Debug for Channel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Channel").field("id", &self.id).finish()
     }
 }
 
@@ -575,6 +660,14 @@ impl AllocatedBuffer<'_> {
 impl Drop for AllocatedBuffer<'_> {
     fn drop(&mut self) {
         unsafe { cuobj_srv_deregister_free(self.server_handle, self.buf) };
+    }
+}
+
+impl std::fmt::Debug for AllocatedBuffer<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllocatedBuffer")
+            .field("buf", &self.buf)
+            .finish()
     }
 }
 
@@ -687,8 +780,12 @@ impl PersistentBuffer {
         token:      &str,
         channel_id: Option<u16>,
     ) -> Result<usize, CuObjServerError> {
-        let remote_start = token_remote_addr(token) + offset;
-        let size = size.min(token_client_size(token).saturating_sub(offset));
+        let remote_start = token_remote_addr(token)? + offset;
+        let max_size = token_client_size(token)?.saturating_sub(offset);
+        if size > max_size {
+            eprintln!("[cuobj] PersistentBuffer::handle_put: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
+        }
+        let size = size.min(max_size);
         match channel_id {
             Some(ch_id) => do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id),
             None => {
@@ -696,9 +793,8 @@ impl PersistentBuffer {
                 if ch_id == u16::MAX {
                     return Err(CuObjServerError::ChannelAllocFailed);
                 }
-                let result = do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id);
-                unsafe { cuobj_srv_free_channel(self.server.handle, ch_id) };
-                result
+                let _scoped = ScopedChannel { server_handle: self.server.handle, id: ch_id };
+                do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id)
             }
         }
     }
@@ -718,8 +814,12 @@ impl PersistentBuffer {
         token:      &str,
         channel_id: Option<u16>,
     ) -> Result<usize, CuObjServerError> {
-        let remote_start = token_remote_addr(token) + offset;
-        let size = size.min(token_client_size(token).saturating_sub(offset));
+        let remote_start = token_remote_addr(token)? + offset;
+        let max_size = token_client_size(token)?.saturating_sub(offset);
+        if size > max_size {
+            eprintln!("[cuobj] PersistentBuffer::handle_get: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
+        }
+        let size = size.min(max_size);
         match channel_id {
             Some(ch_id) => do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id),
             None => {
@@ -727,9 +827,8 @@ impl PersistentBuffer {
                 if ch_id == u16::MAX {
                     return Err(CuObjServerError::ChannelAllocFailed);
                 }
-                let result = do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id);
-                unsafe { cuobj_srv_free_channel(self.server.handle, ch_id) };
-                result
+                let _scoped = ScopedChannel { server_handle: self.server.handle, id: ch_id };
+                do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id)
             }
         }
     }
@@ -762,8 +861,12 @@ impl PersistentBuffer {
         channel_id:   u16,
         async_handle: *mut c_void,
     ) -> Result<(), CuObjServerError> {
-        let remote_start = token_remote_addr(token) + offset;
-        let size = size.min(token_client_size(token).saturating_sub(offset));
+        let remote_start = token_remote_addr(token)? + offset;
+        let max_size = token_client_size(token)?.saturating_sub(offset);
+        if size > max_size {
+            eprintln!("[cuobj] submit_put_async: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
+        }
+        let size = size.min(max_size);
         let key_cs = CString::new(key)?;
         let tok_cs = CString::new(token)?;
         let rc = unsafe {
@@ -803,8 +906,12 @@ impl PersistentBuffer {
         channel_id:   u16,
         async_handle: *mut c_void,
     ) -> Result<(), CuObjServerError> {
-        let remote_start = token_remote_addr(token) + offset;
-        let size = size.min(token_client_size(token).saturating_sub(offset));
+        let remote_start = token_remote_addr(token)? + offset;
+        let max_size = token_client_size(token)?.saturating_sub(offset);
+        if size > max_size {
+            eprintln!("[cuobj] submit_get_async: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
+        }
+        let size = size.min(max_size);
         let key_cs = CString::new(key)?;
         let tok_cs = CString::new(token)?;
         let rc = unsafe {
@@ -829,5 +936,13 @@ impl PersistentBuffer {
 impl Drop for PersistentBuffer {
     fn drop(&mut self) {
         unsafe { cuobj_srv_deregister_free(self.server.handle, self.buf) };
+    }
+}
+
+impl std::fmt::Debug for PersistentBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentBuffer")
+            .field("buf", &self.buf)
+            .finish()
     }
 }
