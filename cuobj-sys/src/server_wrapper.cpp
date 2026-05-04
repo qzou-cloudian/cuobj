@@ -197,6 +197,12 @@ ssize_t cuobj_srv_handle_put(
 {
     CuObjSrvHandle *h   = static_cast<CuObjSrvHandle *>(handle);
     CuObjSrvBuffer *buf = static_cast<CuObjSrvBuffer *>(buf_handle);
+    ibv_wc_status wc_status = IBV_WC_SUCCESS;
+    static int put_call_count = 0;
+    int call_no = ++put_call_count;
+    fprintf(stderr,
+        "[cuobj-shim] handlePutObject #%d key='%s' remote_start=0x%lx size=%zu desc='%s' ch=%u\n",
+        call_no, key, (unsigned long)remote_buf_start, size, rdma_descr, (unsigned)channel);
     ssize_t n = h->server->handlePutObject(
         std::string(key),
         buf->rbuf,
@@ -205,8 +211,43 @@ ssize_t cuobj_srv_handle_put(
         std::string(rdma_descr),
         channel,
         /*local_offset=*/0,
-        /*wc_status_out=*/nullptr);
+        &wc_status);
+    fprintf(stderr,
+        "[cuobj-shim] handlePutObject #%d returned %zd, wc_status=%d (%s)\n",
+        call_no, n, (int)wc_status, ibv_wc_status_str(wc_status));
     return n;
+}
+
+/**
+ * Submit an async S3 PUT (RDMA_READ) on the given channel.
+ *
+ * `async_handle` must be non-NULL; the caller identifies its in-flight request
+ * via this pointer when polling for completions.
+ *
+ * @return 0 on successful submission, or -1 on failure.
+ */
+ssize_t cuobj_srv_handle_put_async(
+    void       *handle,
+    const char *key,
+    void       *buf_handle,
+    uint64_t    remote_buf_start,
+    size_t      size,
+    const char *rdma_descr,
+    uint16_t    channel,
+    void       *async_handle)
+{
+    CuObjSrvHandle *h   = static_cast<CuObjSrvHandle *>(handle);
+    CuObjSrvBuffer *buf = static_cast<CuObjSrvBuffer *>(buf_handle);
+    return h->server->handlePutObject(
+        std::string(key),
+        buf->rbuf,
+        remote_buf_start,
+        size,
+        std::string(rdma_descr),
+        channel,
+        /*local_offset=*/0,
+        /*status=*/nullptr,
+        async_handle);
 }
 
 /**
@@ -238,6 +279,55 @@ ssize_t cuobj_srv_handle_get(
         std::string(rdma_descr),
         channel,
         /*local_offset=*/0);
+}
+
+/**
+ * Submit an async S3 GET (RDMA_WRITE) on the given channel.
+ *
+ * Populate `buf_handle`'s host_ptr with the object data before calling.
+ * `async_handle` must be non-NULL.
+ *
+ * @return 0 on successful submission, or -1 on failure.
+ */
+ssize_t cuobj_srv_handle_get_async(
+    void       *handle,
+    const char *key,
+    void       *buf_handle,
+    uint64_t    remote_buf_start,
+    size_t      size,
+    const char *rdma_descr,
+    uint16_t    channel,
+    void       *async_handle)
+{
+    CuObjSrvHandle *h   = static_cast<CuObjSrvHandle *>(handle);
+    CuObjSrvBuffer *buf = static_cast<CuObjSrvBuffer *>(buf_handle);
+    return h->server->handleGetObject(
+        std::string(key),
+        buf->rbuf,
+        remote_buf_start,
+        size,
+        std::string(rdma_descr),
+        channel,
+        /*local_offset=*/0,
+        /*status=*/nullptr,
+        async_handle);
+}
+
+/**
+ * Poll for completions of async PUT/GET operations on the given channel.
+ *
+ * `events` must point to an array of at least `max_events` elements.
+ * Returns the number of completed events (0 to max_events), or negative on
+ * error.
+ */
+int cuobj_srv_poll(
+    void              *handle,
+    cuObjAsyncEvent_t *events,
+    int                max_events,
+    uint16_t           channel)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    return h->server->poll(events, max_events, channel);
 }
 
 } // extern "C"

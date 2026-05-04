@@ -16,16 +16,10 @@ pub mod client;
 #[cfg(feature = "server")]
 pub mod server;
 
-#[cfg(feature = "buffer-pool")]
-pub mod pool;
-
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "client")]
-pub use client::{CuObjClient, CuObjClientError, MemoryType, OpType, RdmaToken};
+pub use client::{CuObjClient, CuObjClientError, CuObjRdmaToken, MemoryType, OpType, RegisteredBuffer};
 
 #[cfg(feature = "server")]
-pub use server::{AllocatedBuffer, Channel, CuObjServer, CuObjServerError, PersistentBuffer};
-
-#[cfg(feature = "buffer-pool")]
-pub use pool::{BufferGuard, BufferPool, BufferPoolBuilder, BufferPoolError, OwnedBufferGuard};
+pub use server::{AllocatedBuffer, Channel, CuObjAsyncEvent, CuObjServer, CuObjServerError, PersistentBuffer};

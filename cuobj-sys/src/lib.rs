@@ -141,6 +141,27 @@ extern "C" {
 // cuObjServer FFI (server_wrapper.cpp → libcuobjserver.so)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Completion event returned by [`cuobj_srv_poll`].
+///
+/// Mirrors `cuObjAsyncEvent_t` from `cuobjserver.h`.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct CuObjAsyncEvent {
+    /// Opaque handle supplied by the caller when submitting an async operation.
+    pub async_handle: *mut c_void,
+    /// Bytes transferred on success; negative error code on failure.
+    pub status: isize,
+}
+
+// SAFETY: `async_handle` is an opaque caller-supplied cookie.  The caller is
+// responsible for ensuring the pointed-to data is thread-safe; the struct
+// itself is plain data (two words) with no interior mutability.
+#[cfg(feature = "server")]
+unsafe impl Send for CuObjAsyncEvent {}
+#[cfg(feature = "server")]
+unsafe impl Sync for CuObjAsyncEvent {}
+
 #[cfg(feature = "server")]
 extern "C" {
     /// Create a `cuObjServer` bound to the given RDMA NIC `ip` and `port`.
@@ -217,4 +238,42 @@ extern "C" {
         rdma_descr: *const c_char,
         channel: u16,
     ) -> isize;
+
+    /// Submit an async S3 PUT (`cuObjServer::handlePutObject` with non-NULL
+    /// `async_handle`).  Returns 0 on successful submission or -1 on failure.
+    /// Call [`cuobj_srv_poll`] on the same channel to harvest completions.
+    pub fn cuobj_srv_handle_put_async(
+        handle:          *mut c_void,
+        key:             *const c_char,
+        buf:             *mut c_void,
+        remote_buf_start: u64,
+        size:            usize,
+        rdma_descr:      *const c_char,
+        channel:         u16,
+        async_handle:    *mut c_void,
+    ) -> isize;
+
+    /// Submit an async S3 GET (`cuObjServer::handleGetObject` with non-NULL
+    /// `async_handle`).  Returns 0 on successful submission or -1 on failure.
+    /// Call [`cuobj_srv_poll`] on the same channel to harvest completions.
+    pub fn cuobj_srv_handle_get_async(
+        handle:          *mut c_void,
+        key:             *const c_char,
+        buf:             *mut c_void,
+        remote_buf_start: u64,
+        size:            usize,
+        rdma_descr:      *const c_char,
+        channel:         u16,
+        async_handle:    *mut c_void,
+    ) -> isize;
+
+    /// Poll for completions on `channel`.  Fills up to `max_events` entries in
+    /// `events`.  Returns the number of events filled (≥ 0) or a negative
+    /// error code.
+    pub fn cuobj_srv_poll(
+        handle:     *mut c_void,
+        events:     *mut CuObjAsyncEvent,
+        max_events: std::os::raw::c_int,
+        channel:    u16,
+    ) -> std::os::raw::c_int;
 }

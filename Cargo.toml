@@ -13,13 +13,10 @@ categories  = ["api-bindings", "network-programming"]
 default = []
 client      = ["dep:cuobj-sys", "cuobj-sys/client"]
 server      = ["dep:cuobj-sys", "cuobj-sys/server"]
-buffer-pool = ["dep:crossbeam", "dep:tokio"]
 
 [dependencies]
 cuobj-sys = { path = "./cuobj-sys", optional = true }
 thiserror  = "1"
-crossbeam  = { version = "0.8", features = ["crossbeam-queue"], optional = true }
-tokio      = { version = "1",   features = ["sync"],            optional = true }
 
 [dev-dependencies]
 tempfile = "3"

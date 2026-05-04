@@ -43,10 +43,12 @@ use std::ffi::{CString, c_void};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+pub use cuobj_sys::CuObjAsyncEvent;
 use cuobj_sys::{
     cuobj_srv_alloc_channel, cuobj_srv_alloc_register, cuobj_srv_buf_data, cuobj_srv_buf_size,
     cuobj_srv_create, cuobj_srv_deregister_free, cuobj_srv_destroy, cuobj_srv_free_channel,
-    cuobj_srv_handle_get, cuobj_srv_handle_put, cuobj_srv_is_connected,
+    cuobj_srv_handle_get, cuobj_srv_handle_get_async, cuobj_srv_handle_put,
+    cuobj_srv_handle_put_async, cuobj_srv_is_connected, cuobj_srv_poll,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,6 +78,10 @@ pub enum CuObjServerError {
     /// An RDMA GET (RDMA_WRITE to client) failed.
     #[error("RDMA GET failed for key '{key}': server returned {transferred} (expected >0)")]
     GetFailed { key: String, transferred: isize },
+
+    /// `allocateChannelId` returned `INVALID_CHANNEL_ID` — no channels available.
+    #[error("channel allocation failed: no channels available (server returned INVALID_CHANNEL_ID)")]
+    ChannelAllocFailed,
 
     /// A NUL byte appeared in a string argument.
     #[error("argument contains interior NUL byte: {0}")]
@@ -127,6 +133,18 @@ fn token_remote_addr(token: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Extract the client buffer size (second colon-separated hex field) from a
+/// cuObj RDMA token.  Returns `usize::MAX` if the field is missing or
+/// unparseable, so callers that `min()` against it are unaffected.
+fn token_client_size(token: &str) -> usize {
+    token
+        .split(':')
+        .nth(1)
+        .and_then(|s| usize::from_str_radix(s, 16).ok())
+        .unwrap_or(usize::MAX)
+}
+
+/// Internal helper: call `cuobj_srv_handle_put` given raw handles.
 fn do_handle_put(
     server_handle: *mut c_void,
     key:           &str,
@@ -185,6 +203,9 @@ fn do_handle_get(
 }
 
 pub struct CuObjServer {
+    /// Raw `CuObjSrvHandle*`.  `pub(crate)` so [`PersistentBuffer::new`] can
+    /// call `cuobj_srv_alloc_register` without a lifetime-bound borrow of
+    /// `CuObjServer`.
     pub(crate) handle: *mut c_void,
 }
 
@@ -228,13 +249,48 @@ impl CuObjServer {
     /// The channel is returned to the pool when the returned [`Channel`] is
     /// dropped.  Every concurrent RDMA transfer (across threads) must hold a
     /// distinct channel.
-    pub fn alloc_channel(&self) -> Channel<'_> {
+    ///
+    /// Returns [`CuObjServerError::ChannelAllocFailed`] when no channels are
+    /// available (`INVALID_CHANNEL_ID` returned by the C API).
+    pub fn alloc_channel(&self) -> Result<Channel<'_>, CuObjServerError> {
         let id = unsafe { cuobj_srv_alloc_channel(self.handle) };
-        Channel {
+        if id == u16::MAX {
+            return Err(CuObjServerError::ChannelAllocFailed);
+        }
+        Ok(Channel {
             server_handle: self.handle,
             id,
             _server: PhantomData,
+        })
+    }
+
+    /// Poll for completed async operations on `channel`.
+    ///
+    /// Fills up to `events.len()` entries and returns the number completed.
+    /// Non-blocking — returns 0 if no completions are ready yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CuObjServerError::AllocError`] on unexpected C-level errors.
+    pub fn poll_channel(
+        &self,
+        events:     &mut [CuObjAsyncEvent],
+        channel_id: u16,
+    ) -> Result<usize, CuObjServerError> {
+        let n = unsafe {
+            cuobj_srv_poll(
+                self.handle,
+                events.as_mut_ptr(),
+                events.len() as std::os::raw::c_int,
+                channel_id,
+            )
+        };
+        if n < 0 {
+            return Err(CuObjServerError::AllocError(
+                format!("cuobj_srv_poll returned {n}"),
+            ));
         }
+        Ok(n as usize)
     }
 
     // ── Buffer management ────────────────────────────────────────────────────
@@ -295,6 +351,7 @@ impl CuObjServer {
         channel: &Channel<'_>,
     ) -> Result<usize, CuObjServerError> {
         let remote_start = token_remote_addr(rdma_token) + offset as usize;
+        let size = size.min(token_client_size(rdma_token).saturating_sub(offset as usize));
         do_handle_put(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
@@ -323,6 +380,7 @@ impl CuObjServer {
         channel: &Channel<'_>,
     ) -> Result<usize, CuObjServerError> {
         let remote_start = token_remote_addr(rdma_token) + offset as usize;
+        let size = size.min(token_client_size(rdma_token).saturating_sub(offset as usize));
         do_handle_get(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
@@ -356,7 +414,7 @@ impl CuObjServer {
         rdma_token: &str,
     ) -> Result<Vec<u8>, CuObjServerError> {
         let buf     = self.alloc_buffer(size)?;
-        let channel = self.alloc_channel();
+        let channel = self.alloc_channel()?;
         let n       = self.handle_put(key, &buf, offset, size, rdma_token, &channel)?;
         // Copy out of the RDMA-registered buffer before it is freed on drop.
         let data = buf.as_slice()[..n].to_vec();
@@ -392,7 +450,7 @@ impl CuObjServer {
         let mut buf = self.alloc_buffer(data.len())?;
         // Fill the RDMA-registered buffer with the object data.
         buf.as_mut_slice().copy_from_slice(data);
-        let channel = self.alloc_channel();
+        let channel = self.alloc_channel()?;
         let n       = self.handle_get(key, &buf, offset, data.len(), rdma_token, &channel)?;
         Ok(n)
         // `channel` and `buf` drop here → free channel ID and deregister buffer.
@@ -435,7 +493,10 @@ impl Channel<'_> {
 
 impl Drop for Channel<'_> {
     fn drop(&mut self) {
-        unsafe { cuobj_srv_free_channel(self.server_handle, self.id) };
+        // u16::MAX == INVALID_CHANNEL_ID — freeing it is undefined behaviour.
+        if self.id != u16::MAX {
+            unsafe { cuobj_srv_free_channel(self.server_handle, self.id) };
+        }
     }
 }
 
@@ -484,7 +545,7 @@ impl AllocatedBuffer<'_> {
 
     /// View the buffer contents as a byte slice.
     ///
-    /// # Safety
+    /// # Concurrency
     ///
     /// The caller must ensure no concurrent mutable access exists for the
     /// duration of the returned reference.
@@ -498,7 +559,7 @@ impl AllocatedBuffer<'_> {
 
     /// View the buffer contents as a mutable byte slice.
     ///
-    /// # Safety
+    /// # Concurrency
     ///
     /// The caller must ensure no other references (mutable or shared) to this
     /// buffer exist for the duration of the returned reference.
@@ -588,7 +649,7 @@ impl PersistentBuffer {
 
     /// View the buffer as a byte slice.
     ///
-    /// # Safety
+    /// # Concurrency
     ///
     /// The caller must ensure no concurrent mutable access exists.
     pub fn as_slice(&self) -> &[u8] {
@@ -599,6 +660,11 @@ impl PersistentBuffer {
     }
 
     /// View the buffer as a mutable byte slice.
+    ///
+    /// # Concurrency
+    ///
+    /// The caller must ensure no other references (mutable or shared) to this
+    /// buffer exist for the duration of the returned reference.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe {
             let ptr = cuobj_srv_buf_data(self.buf) as *mut u8;
@@ -608,40 +674,64 @@ impl PersistentBuffer {
 
     /// Perform an RDMA_READ from the remote client buffer into this buffer.
     ///
-    /// A fresh channel is allocated internally and freed when the operation
-    /// completes.  `offset` is the byte offset within the client's registered
-    /// buffer; use `0` for a full-buffer transfer.
+    /// `offset` is the byte offset within the client's registered buffer.
+    /// When `channel_id` is `None` a fresh channel is allocated and freed
+    /// around the call; pass `Some(id)` from a pre-allocated
+    /// [`Channel`] to avoid that overhead (required for safe concurrent use
+    /// from multiple threads).
     pub fn handle_put(
         &self,
-        key:    &str,
-        offset: usize,
-        size:   usize,
-        token:  &str,
+        key:        &str,
+        offset:     usize,
+        size:       usize,
+        token:      &str,
+        channel_id: Option<u16>,
     ) -> Result<usize, CuObjServerError> {
         let remote_start = token_remote_addr(token) + offset;
-        let ch_id = unsafe { cuobj_srv_alloc_channel(self.server.handle) };
-        let result = do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id);
-        unsafe { cuobj_srv_free_channel(self.server.handle, ch_id) };
-        result
+        let size = size.min(token_client_size(token).saturating_sub(offset));
+        match channel_id {
+            Some(ch_id) => do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id),
+            None => {
+                let ch_id = unsafe { cuobj_srv_alloc_channel(self.server.handle) };
+                if ch_id == u16::MAX {
+                    return Err(CuObjServerError::ChannelAllocFailed);
+                }
+                let result = do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id);
+                unsafe { cuobj_srv_free_channel(self.server.handle, ch_id) };
+                result
+            }
+        }
     }
 
     /// Perform an RDMA_WRITE from this buffer into the remote client buffer.
     ///
-    /// A fresh channel is allocated internally and freed when the operation
-    /// completes.  `offset` is the byte offset within the client's registered
-    /// buffer to write into; use `0` for a full-buffer transfer.
+    /// `offset` is the byte offset within the client's registered buffer to
+    /// write into.  When `channel_id` is `None` a fresh channel is allocated
+    /// and freed around the call; pass `Some(id)` from a pre-allocated
+    /// [`Channel`] to avoid that overhead (required for safe concurrent use
+    /// from multiple threads).
     pub fn handle_get(
         &self,
-        key:    &str,
-        offset: usize,
-        size:   usize,
-        token:  &str,
+        key:        &str,
+        offset:     usize,
+        size:       usize,
+        token:      &str,
+        channel_id: Option<u16>,
     ) -> Result<usize, CuObjServerError> {
         let remote_start = token_remote_addr(token) + offset;
-        let ch_id = unsafe { cuobj_srv_alloc_channel(self.server.handle) };
-        let result = do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id);
-        unsafe { cuobj_srv_free_channel(self.server.handle, ch_id) };
-        result
+        let size = size.min(token_client_size(token).saturating_sub(offset));
+        match channel_id {
+            Some(ch_id) => do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id),
+            None => {
+                let ch_id = unsafe { cuobj_srv_alloc_channel(self.server.handle) };
+                if ch_id == u16::MAX {
+                    return Err(CuObjServerError::ChannelAllocFailed);
+                }
+                let result = do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id);
+                unsafe { cuobj_srv_free_channel(self.server.handle, ch_id) };
+                result
+            }
+        }
     }
 
     /// Raw pointer to the internal `CuObjSrvBuffer*` handle.
@@ -650,6 +740,89 @@ impl PersistentBuffer {
     /// directly (e.g., to pair with a pre-allocated channel).
     pub fn raw_buf_handle(&self) -> *mut c_void {
         self.buf
+    }
+
+    /// Submit an async RDMA PUT (RDMA_READ from client into this buffer).
+    ///
+    /// Returns immediately after submission (return value 0 from the C API).
+    /// Call [`CuObjServer::poll_channel`] on `channel_id` to retrieve the
+    /// completion; `async_handle` will be returned in the event to identify
+    /// this operation.
+    ///
+    /// # Safety
+    ///
+    /// `async_handle` must remain valid until the corresponding completion is
+    /// harvested via [`CuObjServer::poll_channel`].
+    pub fn submit_put_async(
+        &self,
+        key:          &str,
+        offset:       usize,
+        size:         usize,
+        token:        &str,
+        channel_id:   u16,
+        async_handle: *mut c_void,
+    ) -> Result<(), CuObjServerError> {
+        let remote_start = token_remote_addr(token) + offset;
+        let size = size.min(token_client_size(token).saturating_sub(offset));
+        let key_cs = CString::new(key)?;
+        let tok_cs = CString::new(token)?;
+        let rc = unsafe {
+            cuobj_srv_handle_put_async(
+                self.server.handle,
+                key_cs.as_ptr(),
+                self.buf,
+                remote_start as u64,
+                size,
+                tok_cs.as_ptr(),
+                channel_id,
+                async_handle,
+            )
+        };
+        if rc < 0 {
+            return Err(CuObjServerError::PutFailed { key: key.to_owned(), transferred: rc });
+        }
+        Ok(())
+    }
+
+    /// Submit an async RDMA GET (RDMA_WRITE from this buffer to client).
+    ///
+    /// Populate this buffer with the object data **before** calling.
+    /// Returns immediately after submission.  Call [`CuObjServer::poll_channel`]
+    /// to retrieve the completion.
+    ///
+    /// # Safety
+    ///
+    /// `async_handle` must remain valid until the corresponding completion is
+    /// harvested via [`CuObjServer::poll_channel`].
+    pub fn submit_get_async(
+        &self,
+        key:          &str,
+        offset:       usize,
+        size:         usize,
+        token:        &str,
+        channel_id:   u16,
+        async_handle: *mut c_void,
+    ) -> Result<(), CuObjServerError> {
+        let remote_start = token_remote_addr(token) + offset;
+        let size = size.min(token_client_size(token).saturating_sub(offset));
+        let key_cs = CString::new(key)?;
+        let tok_cs = CString::new(token)?;
+        let rc = unsafe {
+            cuobj_srv_handle_get_async(
+                self.server.handle,
+                key_cs.as_ptr(),
+                self.buf,
+                remote_start as u64,
+                size,
+                tok_cs.as_ptr(),
+                channel_id,
+                async_handle,
+            )
+        };
+        if rc < 0 {
+            return Err(CuObjServerError::GetFailed { key: key.to_owned(), transferred: rc });
+        }
+        Ok(())
     }
 }
 
