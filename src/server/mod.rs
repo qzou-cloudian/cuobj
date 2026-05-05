@@ -337,6 +337,9 @@ impl CuObjServer {
         unsafe { cuobj_srv_is_connected(self.handle) != 0 }
     }
 
+    /// Raw C++ server handle for direct FFI use.
+    pub fn handle(&self) -> *mut c_void { self.handle }
+
     // ── Telemetry (static / library-wide) ────────────────────────────────────
 
     /// Set up the telemetry output stream for all `cuObjServer` instances in
