@@ -387,6 +387,20 @@ impl CuObjServer {
         })
     }
 
+    /// Free a channel by its raw `u16` ID, bypassing the [`Channel`] RAII guard.
+    ///
+    /// Use this when the channel was allocated via [`alloc_channel`][Self::alloc_channel]
+    /// and the [`Channel`] guard was leaked (e.g., via [`std::mem::forget`]) to
+    /// decouple the channel lifetime from the server borrow.  This is necessary
+    /// for worker threads that outlive a single `&CuObjServer` reference.
+    ///
+    /// Passing `u16::MAX` (`INVALID_CHANNEL_ID`) is a no-op.
+    pub fn free_channel_by_id(&self, channel_id: u16) {
+        if channel_id != u16::MAX {
+            unsafe { cuobj_srv_free_channel(self.handle, channel_id) };
+        }
+    }
+
     /// Poll for completed async operations on `channel`.
     ///
     /// Fills up to `events.len()` entries and returns the number completed.
