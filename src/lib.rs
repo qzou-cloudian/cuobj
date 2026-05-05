@@ -22,4 +22,4 @@ pub mod server;
 pub use client::{CuObjClient, CuObjClientError, CuObjRdmaToken, MemoryType, OpType, RegisteredBuffer};
 
 #[cfg(feature = "server")]
-pub use server::{AllocatedBuffer, Channel, CuObjAsyncEvent, CuObjServer, CuObjServerError, PersistentBuffer};
+pub use server::{AllocatedBuffer, Channel, CuObjAsyncEvent, CuObjServer, CuObjServerError, PersistentBuffer, WcStatus};

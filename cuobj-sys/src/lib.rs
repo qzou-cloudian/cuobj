@@ -152,6 +152,14 @@ extern "C" {
 // cuObjServer FFI (server_wrapper.cpp → libcuobjserver.so)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// InfiniBand verbs completion status.
+///
+/// Mirrors `ibv_wc_status` from `<infiniband/verbs.h>`.  Only the values that
+/// can be reported by the cuObj server are listed here; unknown values are
+/// preserved as their raw integer.
+#[cfg(feature = "server")]
+pub type ibv_wc_status = i32;
+
 /// Completion event returned by [`cuobj_srv_poll`].
 ///
 /// Mirrors `cuObjAsyncEvent_t` from `cuobjserver.h`.
@@ -231,6 +239,7 @@ extern "C" {
         size: usize,
         rdma_descr: *const c_char,
         channel: u16,
+        status: *mut ibv_wc_status,
     ) -> isize;
 
     /// Handle an S3 GET: RDMA_WRITE from the server's local `buf` into the
@@ -240,6 +249,8 @@ extern "C" {
     /// calling this function.
     ///
     /// Returns bytes transferred on success, or `-1` on failure.
+    /// On failure, `*status` receives the InfiniBand WC completion status
+    /// (pass null if not needed).
     pub fn cuobj_srv_handle_get(
         handle: *mut c_void,
         key: *const c_char,
@@ -248,6 +259,7 @@ extern "C" {
         size: usize,
         rdma_descr: *const c_char,
         channel: u16,
+        status: *mut ibv_wc_status,
     ) -> isize;
 
     /// Submit an async S3 PUT (`cuObjServer::handlePutObject` with non-NULL

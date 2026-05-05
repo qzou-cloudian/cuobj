@@ -50,7 +50,47 @@ use cuobj_sys::{
     cuobj_srv_handle_get, cuobj_srv_handle_get_async, cuobj_srv_handle_put,
     cuobj_srv_handle_put_async, cuobj_srv_is_connected, cuobj_srv_poll,
     cuobj_srv_set_telem_flags, cuobj_srv_setup_telemetry, cuobj_srv_shutdown_telemetry,
+    ibv_wc_status,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WC status display helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Human-readable wrapper around [`ibv_wc_status`].
+#[derive(Clone, Copy, Debug)]
+pub struct WcStatus(pub ibv_wc_status);
+
+impl std::fmt::Display for WcStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self.0 {
+            0  => "SUCCESS",
+            1  => "LOC_LEN_ERR",
+            2  => "LOC_QP_OP_ERR",
+            3  => "LOC_EEC_OP_ERR",
+            4  => "LOC_PROT_ERR",
+            5  => "WR_FLUSH_ERR",
+            6  => "MW_BIND_ERR",
+            7  => "BAD_RESP_ERR",
+            8  => "LOC_ACCESS_ERR",
+            9  => "REM_INV_REQ_ERR",
+            10 => "REM_ACCESS_ERR",
+            11 => "REM_OP_ERR",
+            12 => "RETRY_EXC_ERR",
+            13 => "RNR_RETRY_EXC_ERR",
+            14 => "LOC_RDD_VIOL_ERR",
+            15 => "REM_INV_RD_REQ_ERR",
+            16 => "REM_ABORT_ERR",
+            17 => "INV_EECN_ERR",
+            18 => "INV_EEC_STATE_ERR",
+            19 => "FATAL_ERR",
+            20 => "RESP_TIMEOUT_ERR",
+            21 => "GENERAL_ERR",
+            _  => return write!(f, "{}", self.0),
+        };
+        write!(f, "{name} ({})", self.0)
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -68,17 +108,21 @@ pub enum CuObjServerError {
     #[error("failed to allocate/register RDMA buffer of size {size}")]
     BufferAllocFailed { size: usize },
 
-    /// A generic allocation or registration error.
-    #[error("allocation error: {0}")]
-    AllocError(String),
+    /// Polling the completion queue failed.
+    #[error("poll channel (id={channel_id}) failed: cuobj_srv_poll returned {raw_return}")]
+    PollFailed { channel_id: u16, raw_return: isize },
+
+    /// Async operation submission failed (before any RDMA transfer started).
+    #[error("async submission of key '{key}' failed: server returned {raw_return}")]
+    SubmitFailed { key: String, raw_return: isize },
 
     /// An RDMA PUT (RDMA_READ from client) failed.
-    #[error("RDMA PUT failed for key '{key}': server returned {transferred} (expected >0)")]
-    PutFailed { key: String, transferred: isize },
+    #[error("RDMA PUT failed for key '{key}': server returned {transferred}, WC status: {wc_status}")]
+    PutFailed { key: String, transferred: isize, wc_status: WcStatus },
 
     /// An RDMA GET (RDMA_WRITE to client) failed.
-    #[error("RDMA GET failed for key '{key}': server returned {transferred} (expected >0)")]
-    GetFailed { key: String, transferred: isize },
+    #[error("RDMA GET failed for key '{key}': server returned {transferred}, WC status: {wc_status}")]
+    GetFailed { key: String, transferred: isize, wc_status: WcStatus },
 
     /// `allocateChannelId` returned `INVALID_CHANNEL_ID` — no channels available.
     #[error("channel allocation failed: no channels available (server returned INVALID_CHANNEL_ID)")]
@@ -155,6 +199,18 @@ fn token_client_size(token: &str) -> Result<usize, CuObjServerError> {
         ))
 }
 
+/// Resolve the remote buffer start address and clamp the transfer size to
+/// the client buffer limit encoded in the token. Returns `(remote_start, clamped_size)`.
+fn token_resolve_clamp(
+    token: &str,
+    offset: usize,
+    size: usize,
+) -> Result<(usize, usize), CuObjServerError> {
+    let remote_start = token_remote_addr(token)? + offset;
+    let max_size = token_client_size(token)?.saturating_sub(offset);
+    Ok((remote_start, size.min(max_size)))
+}
+
 /// Internal helper: call `cuobj_srv_handle_put` given raw handles.
 fn do_handle_put(
     server_handle: *mut c_void,
@@ -167,6 +223,7 @@ fn do_handle_put(
 ) -> Result<usize, CuObjServerError> {
     let key_cs = CString::new(key)?;
     let tok_cs = CString::new(rdma_token)?;
+    let mut wc_status: ibv_wc_status = 0;
     let n = unsafe {
         cuobj_srv_handle_put(
             server_handle,
@@ -176,10 +233,15 @@ fn do_handle_put(
             size,
             tok_cs.as_ptr(),
             channel_id,
+            &mut wc_status,
         )
     };
     if n < 0 {
-        return Err(CuObjServerError::PutFailed { key: key.to_owned(), transferred: n });
+        return Err(CuObjServerError::PutFailed {
+            key: key.to_owned(),
+            transferred: n,
+            wc_status: WcStatus(wc_status),
+        });
     }
     Ok(n as usize)
 }
@@ -211,6 +273,7 @@ fn do_handle_get(
 ) -> Result<usize, CuObjServerError> {
     let key_cs = CString::new(key)?;
     let tok_cs = CString::new(rdma_token)?;
+    let mut wc_status: ibv_wc_status = 0;
     let n = unsafe {
         cuobj_srv_handle_get(
             server_handle,
@@ -220,10 +283,15 @@ fn do_handle_get(
             size,
             tok_cs.as_ptr(),
             channel_id,
+            &mut wc_status,
         )
     };
     if n < 0 {
-        return Err(CuObjServerError::GetFailed { key: key.to_owned(), transferred: n });
+        return Err(CuObjServerError::GetFailed {
+            key: key.to_owned(),
+            transferred: n,
+            wc_status: WcStatus(wc_status),
+        });
     }
     Ok(n as usize)
 }
@@ -326,7 +394,9 @@ impl CuObjServer {
     ///
     /// # Errors
     ///
-    /// Returns [`CuObjServerError::AllocError`] on unexpected C-level errors.
+    /// # Errors
+    ///
+    /// Returns [`CuObjServerError::PollFailed`] on unexpected C-level errors.
     pub fn poll_channel(
         &self,
         events:     &mut [CuObjAsyncEvent],
@@ -341,9 +411,10 @@ impl CuObjServer {
             )
         };
         if n < 0 {
-            return Err(CuObjServerError::AllocError(
-                format!("cuobj_srv_poll returned {n}"),
-            ));
+            return Err(CuObjServerError::PollFailed {
+                channel_id,
+                raw_return: n as isize,
+            });
         }
         Ok(n as usize)
     }
@@ -365,9 +436,13 @@ impl CuObjServer {
         if buf.is_null() {
             return Err(CuObjServerError::BufferAllocFailed { size });
         }
+        let data_ptr = unsafe { cuobj_srv_buf_data(buf) as *mut u8 };
+        let buf_size = unsafe { cuobj_srv_buf_size(buf) };
         Ok(AllocatedBuffer {
             server_handle: self.handle,
             buf,
+            data_ptr,
+            size: buf_size,
             _server: PhantomData,
         })
     }
@@ -405,12 +480,7 @@ impl CuObjServer {
         rdma_token: &str,
         channel: &Channel<'_>,
     ) -> Result<usize, CuObjServerError> {
-        let remote_start = token_remote_addr(rdma_token)? + offset as usize;
-        let max_size = token_client_size(rdma_token)?.saturating_sub(offset as usize);
-        if size > max_size {
-            eprintln!("[cuobj] handle_put: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
-        }
-        let size = size.min(max_size);
+        let (remote_start, size) = token_resolve_clamp(rdma_token, offset as usize, size)?;
         do_handle_put(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
@@ -438,12 +508,7 @@ impl CuObjServer {
         rdma_token: &str,
         channel: &Channel<'_>,
     ) -> Result<usize, CuObjServerError> {
-        let remote_start = token_remote_addr(rdma_token)? + offset as usize;
-        let max_size = token_client_size(rdma_token)?.saturating_sub(offset as usize);
-        if size > max_size {
-            eprintln!("[cuobj] handle_get: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
-        }
-        let size = size.min(max_size);
+        let (remote_start, size) = token_resolve_clamp(rdma_token, offset as usize, size)?;
         do_handle_get(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
@@ -512,13 +577,6 @@ impl CuObjServer {
         rdma_token: &str,
     ) -> Result<usize, CuObjServerError> {
         let mut buf = self.alloc_buffer(data.len())?;
-        let buf_len = buf.len();
-        if buf_len < data.len() {
-            return Err(CuObjServerError::AllocError(format!(
-                "allocated buffer too small: got {buf_len}, expected >= {}",
-                data.len()
-            )));
-        }
         // Fill the RDMA-registered buffer with the object data.
         buf.as_mut_slice()[..data.len()].copy_from_slice(data);
         let channel = self.alloc_channel()?;
@@ -596,6 +654,8 @@ impl std::fmt::Debug for Channel<'_> {
 pub struct AllocatedBuffer<'a> {
     server_handle: *mut c_void,
     buf:           *mut c_void,
+    data_ptr:      *mut u8,
+    size:          usize,
     _server:       PhantomData<&'a CuObjServer>,
 }
 
@@ -606,26 +666,30 @@ unsafe impl Sync for AllocatedBuffer<'_> {}
 
 impl AllocatedBuffer<'_> {
     /// Length of the buffer in bytes.
+    #[inline]
     pub fn len(&self) -> usize {
-        unsafe { cuobj_srv_buf_size(self.buf) }
+        self.size
     }
 
     /// Returns `true` if the buffer has zero size.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.size == 0
     }
 
     /// Raw pointer to the host data region.
     ///
     /// Use [`as_slice`][Self::as_slice] / [`as_mut_slice`][Self::as_mut_slice]
     /// for slice access.
+    #[inline]
     pub fn as_ptr(&self) -> *const u8 {
-        unsafe { cuobj_srv_buf_data(self.buf) as *const u8 }
+        self.data_ptr as *const u8
     }
 
     /// Raw mutable pointer to the host data region.
+    #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        unsafe { cuobj_srv_buf_data(self.buf) as *mut u8 }
+        self.data_ptr
     }
 
     /// View the buffer contents as a byte slice.
@@ -635,11 +699,7 @@ impl AllocatedBuffer<'_> {
     /// The caller must ensure no concurrent mutable access exists for the
     /// duration of the returned reference.
     pub fn as_slice(&self) -> &[u8] {
-        unsafe {
-            let ptr = cuobj_srv_buf_data(self.buf) as *const u8;
-            let len = cuobj_srv_buf_size(self.buf);
-            std::slice::from_raw_parts(ptr, len)
-        }
+        unsafe { std::slice::from_raw_parts(self.data_ptr as *const u8, self.size) }
     }
 
     /// View the buffer contents as a mutable byte slice.
@@ -649,11 +709,7 @@ impl AllocatedBuffer<'_> {
     /// The caller must ensure no other references (mutable or shared) to this
     /// buffer exist for the duration of the returned reference.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe {
-            let ptr = cuobj_srv_buf_data(self.buf) as *mut u8;
-            let len = cuobj_srv_buf_size(self.buf);
-            std::slice::from_raw_parts_mut(ptr, len)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.size) }
     }
 }
 
@@ -698,8 +754,10 @@ impl std::fmt::Debug for AllocatedBuffer<'_> {
 /// buf.as_mut_slice().fill(0xAB_u8);
 /// ```
 pub struct PersistentBuffer {
-    server: Arc<CuObjServer>,
-    buf:    *mut c_void,
+    server:   Arc<CuObjServer>,
+    buf:      *mut c_void,
+    data_ptr: *mut u8,
+    size:     usize,
 }
 
 // SAFETY: the server handle is internally thread-safe; each `PersistentBuffer`
@@ -713,31 +771,35 @@ impl PersistentBuffer {
     pub fn new(server: Arc<CuObjServer>, size: usize) -> Result<Self, CuObjServerError> {
         let buf = unsafe { cuobj_srv_alloc_register(server.handle, size) };
         if buf.is_null() {
-            return Err(CuObjServerError::AllocError(
-                "cuobj_srv_alloc_register returned null".into(),
-            ));
+            return Err(CuObjServerError::BufferAllocFailed { size });
         }
-        Ok(Self { server, buf })
+        let data_ptr = unsafe { cuobj_srv_buf_data(buf) as *mut u8 };
+        let buf_size = unsafe { cuobj_srv_buf_size(buf) };
+        Ok(Self { server, buf, data_ptr, size: buf_size })
     }
 
     /// Length of the buffer in bytes.
+    #[inline]
     pub fn len(&self) -> usize {
-        unsafe { cuobj_srv_buf_size(self.buf) }
+        self.size
     }
 
     /// Returns `true` if the buffer has zero size.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.size == 0
     }
 
     /// Raw const pointer to the host data region.
+    #[inline]
     pub fn as_ptr(&self) -> *const u8 {
-        unsafe { cuobj_srv_buf_data(self.buf) as *const u8 }
+        self.data_ptr as *const u8
     }
 
     /// Raw mutable pointer to the host data region.
+    #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        unsafe { cuobj_srv_buf_data(self.buf) as *mut u8 }
+        self.data_ptr
     }
 
     /// View the buffer as a byte slice.
@@ -746,10 +808,7 @@ impl PersistentBuffer {
     ///
     /// The caller must ensure no concurrent mutable access exists.
     pub fn as_slice(&self) -> &[u8] {
-        unsafe {
-            let ptr = cuobj_srv_buf_data(self.buf) as *const u8;
-            std::slice::from_raw_parts(ptr, self.len())
-        }
+        unsafe { std::slice::from_raw_parts(self.data_ptr as *const u8, self.size) }
     }
 
     /// View the buffer as a mutable byte slice.
@@ -759,10 +818,7 @@ impl PersistentBuffer {
     /// The caller must ensure no other references (mutable or shared) to this
     /// buffer exist for the duration of the returned reference.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe {
-            let ptr = cuobj_srv_buf_data(self.buf) as *mut u8;
-            std::slice::from_raw_parts_mut(ptr, self.len())
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.size) }
     }
 
     /// Perform an RDMA_READ from the remote client buffer into this buffer.
@@ -780,12 +836,7 @@ impl PersistentBuffer {
         token:      &str,
         channel_id: Option<u16>,
     ) -> Result<usize, CuObjServerError> {
-        let remote_start = token_remote_addr(token)? + offset;
-        let max_size = token_client_size(token)?.saturating_sub(offset);
-        if size > max_size {
-            eprintln!("[cuobj] PersistentBuffer::handle_put: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
-        }
-        let size = size.min(max_size);
+        let (remote_start, size) = token_resolve_clamp(token, offset, size)?;
         match channel_id {
             Some(ch_id) => do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id),
             None => {
@@ -814,12 +865,7 @@ impl PersistentBuffer {
         token:      &str,
         channel_id: Option<u16>,
     ) -> Result<usize, CuObjServerError> {
-        let remote_start = token_remote_addr(token)? + offset;
-        let max_size = token_client_size(token)?.saturating_sub(offset);
-        if size > max_size {
-            eprintln!("[cuobj] PersistentBuffer::handle_get: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
-        }
-        let size = size.min(max_size);
+        let (remote_start, size) = token_resolve_clamp(token, offset, size)?;
         match channel_id {
             Some(ch_id) => do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id),
             None => {
@@ -861,12 +907,7 @@ impl PersistentBuffer {
         channel_id:   u16,
         async_handle: *mut c_void,
     ) -> Result<(), CuObjServerError> {
-        let remote_start = token_remote_addr(token)? + offset;
-        let max_size = token_client_size(token)?.saturating_sub(offset);
-        if size > max_size {
-            eprintln!("[cuobj] submit_put_async: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
-        }
-        let size = size.min(max_size);
+        let (remote_start, size) = token_resolve_clamp(token, offset, size)?;
         let key_cs = CString::new(key)?;
         let tok_cs = CString::new(token)?;
         let rc = unsafe {
@@ -882,7 +923,10 @@ impl PersistentBuffer {
             )
         };
         if rc < 0 {
-            return Err(CuObjServerError::PutFailed { key: key.to_owned(), transferred: rc });
+            return Err(CuObjServerError::SubmitFailed {
+                key: key.to_owned(),
+                raw_return: rc,
+            });
         }
         Ok(())
     }
@@ -906,12 +950,7 @@ impl PersistentBuffer {
         channel_id:   u16,
         async_handle: *mut c_void,
     ) -> Result<(), CuObjServerError> {
-        let remote_start = token_remote_addr(token)? + offset;
-        let max_size = token_client_size(token)?.saturating_sub(offset);
-        if size > max_size {
-            eprintln!("[cuobj] submit_get_async: clamping transfer size {size} -> {max_size} (client buffer limit, key={key})");
-        }
-        let size = size.min(max_size);
+        let (remote_start, size) = token_resolve_clamp(token, offset, size)?;
         let key_cs = CString::new(key)?;
         let tok_cs = CString::new(token)?;
         let rc = unsafe {
@@ -927,7 +966,10 @@ impl PersistentBuffer {
             )
         };
         if rc < 0 {
-            return Err(CuObjServerError::GetFailed { key: key.to_owned(), transferred: rc });
+            return Err(CuObjServerError::SubmitFailed {
+                key: key.to_owned(),
+                raw_return: rc,
+            });
         }
         Ok(())
     }
@@ -944,5 +986,120 @@ impl std::fmt::Debug for PersistentBuffer {
         f.debug_struct("PersistentBuffer")
             .field("buf", &self.buf)
             .finish()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── WcStatus::Display ──────────────────────────────────────────────────────
+
+    #[test]
+    fn wc_status_display_known() {
+        let names = [
+            (0, "SUCCESS"),
+            (1, "LOC_LEN_ERR"),
+            (2, "LOC_QP_OP_ERR"),
+            (3, "LOC_EEC_OP_ERR"),
+            (4, "LOC_PROT_ERR"),
+            (5, "WR_FLUSH_ERR"),
+            (6, "MW_BIND_ERR"),
+            (7, "BAD_RESP_ERR"),
+            (8, "LOC_ACCESS_ERR"),
+            (9, "REM_INV_REQ_ERR"),
+            (10, "REM_ACCESS_ERR"),
+            (11, "REM_OP_ERR"),
+            (12, "RETRY_EXC_ERR"),
+            (13, "RNR_RETRY_EXC_ERR"),
+            (14, "LOC_RDD_VIOL_ERR"),
+            (15, "REM_INV_RD_REQ_ERR"),
+            (16, "REM_ABORT_ERR"),
+            (17, "INV_EECN_ERR"),
+            (18, "INV_EEC_STATE_ERR"),
+            (19, "FATAL_ERR"),
+            (20, "RESP_TIMEOUT_ERR"),
+            (21, "GENERAL_ERR"),
+        ];
+        for (code, name) in names {
+            let s = WcStatus(code).to_string();
+            assert!(s.contains(name), "expected '{name}' in display for {code}, got: {s}");
+            assert!(s.contains(&code.to_string()), "expected code {code} in display: {s}");
+        }
+    }
+
+    #[test]
+    fn wc_status_display_unknown() {
+        assert_eq!(WcStatus(99).to_string(), "99");
+    }
+
+    // ── token_remote_addr ──────────────────────────────────────────────────────
+
+    #[test]
+    fn token_remote_addr_valid() {
+        // Simulated token: vaddr=0x7f001000, size=0x100000, rkey=0xDEAD
+        let token = "7f001000:100000:DEAD";
+        assert_eq!(token_remote_addr(token).unwrap(), 0x7f001000);
+    }
+
+    #[test]
+    fn token_remote_addr_invalid() {
+        assert!(token_remote_addr("").is_err());
+        assert!(token_remote_addr("xyz").is_err());
+        assert!(token_remote_addr(":size:rkey").is_err());
+    }
+
+    // ── token_client_size ──────────────────────────────────────────────────────
+
+    #[test]
+    fn token_client_size_valid() {
+        let token = "7f001000:100000:DEAD";
+        assert_eq!(token_client_size(token).unwrap(), 0x100000);
+    }
+
+    #[test]
+    fn token_client_size_invalid() {
+        assert!(token_client_size("").is_err());
+        assert!(token_client_size("addr:").is_err());
+        assert!(token_client_size("addr:xyz").is_err());
+    }
+
+    // ── token_resolve_clamp ────────────────────────────────────────────────────
+
+    #[test]
+    fn token_resolve_clamp_no_clamping() {
+        let token = "1000:1000:rkey";
+        let (remote_start, clamped) = token_resolve_clamp(token, 0, 0x500).unwrap();
+        assert_eq!(remote_start, 0x1000);
+        assert_eq!(clamped, 0x500);
+    }
+
+    #[test]
+    fn token_resolve_clamp_exceeds_client_buf() {
+        let token = "1000:1000:rkey";
+        let (_, clamped) = token_resolve_clamp(token, 0, 0x2000).unwrap();
+        assert_eq!(clamped, 0x1000);
+    }
+
+    #[test]
+    fn token_resolve_clamp_with_offset() {
+        let token = "1000:1000:rkey";
+        // Client buffer size 0x1000; offset 0x800 leaves 0x800 available.
+        let (remote_start, clamped) = token_resolve_clamp(token, 0x800, 0x1000).unwrap();
+        assert_eq!(remote_start, 0x1000 + 0x800);
+        assert_eq!(clamped, 0x800);
+    }
+
+    #[test]
+    fn token_resolve_clamp_offset_exceeds_size() {
+        let token = "1000:100:rkey";
+        let (_, clamped) = token_resolve_clamp(token, 0x80, 0x100).unwrap();
+        // offset 0x80 > client size 0x100? No, 0x80 < 0x100. Wait:
+        // client size = 0x100 = 256. offset = 0x80 = 128. max = 0x100 - 0x80 = 0x80.
+        assert_eq!(clamped, 0x80);
     }
 }

@@ -166,6 +166,7 @@ impl OpType {
 /// Both [`CuObjClient`] and any outstanding [`CuObjRdmaToken`]s hold an `Arc`
 /// to this handle so the C++ object is not destroyed until all tokens have been
 /// dropped — even if the `CuObjClient` itself is dropped first.
+#[repr(transparent)]
 struct ClientHandle(*mut c_void);
 
 // SAFETY: cuObjClient is internally thread-safe.
@@ -244,6 +245,16 @@ impl CuObjRdmaToken {
     pub fn into_bytes(self) -> Vec<u8> {
         // Copy first; Drop runs after the function returns.
         self.as_bytes().to_vec()
+    }
+
+    /// Consume the token and return the descriptor as a `String`.
+    ///
+    /// cuObj descriptors are guaranteed ASCII so this never fails in
+    /// practice; if the bytes happen to not be valid UTF-8 they are
+    /// replaced with U+FFFD via `String::from_utf8_lossy`.
+    #[inline]
+    pub fn into_string(self) -> String {
+        String::from_utf8_lossy(self.as_bytes()).into_owned()
     }
 
     /// Length of the descriptor in bytes.
@@ -703,5 +714,54 @@ impl Drop for RegisteredBuffer<'_> {
     fn drop(&mut self) {
         // Ignore errors on drop (can't propagate from Drop).
         let _ = self.client.deregister(self.ptr);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── MemoryType::from_raw ────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_type_from_raw_known() {
+        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_SYSTEM), MemoryType::System);
+        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_CUDA_MANAGED), MemoryType::CudaManaged);
+        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_CUDA_DEVICE), MemoryType::CudaDevice);
+        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_UNKNOWN), MemoryType::Unknown);
+        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_INVALID), MemoryType::Invalid);
+    }
+
+    #[test]
+    fn memory_type_from_raw_unknown_fallback() {
+        assert_eq!(MemoryType::from_raw(999), MemoryType::Unknown);
+    }
+
+    #[test]
+    fn memory_type_is_rdma_suitable() {
+        assert!(MemoryType::System.is_rdma_suitable());
+        assert!(MemoryType::CudaManaged.is_rdma_suitable());
+        assert!(MemoryType::CudaDevice.is_rdma_suitable());
+        assert!(!MemoryType::Unknown.is_rdma_suitable());
+        assert!(!MemoryType::Invalid.is_rdma_suitable());
+    }
+
+    // ── OpType::to_raw ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn op_type_to_raw() {
+        assert_eq!(OpType::Get.to_raw(), CUOBJ_GET);
+        assert_eq!(OpType::Put.to_raw(), CUOBJ_PUT);
+    }
+
+    #[test]
+    fn op_type_roundtrip() {
+        // The raw values match the constants.
+        assert_eq!(OpType::Get.to_raw(), 0);
+        assert_eq!(OpType::Put.to_raw(), 1);
     }
 }

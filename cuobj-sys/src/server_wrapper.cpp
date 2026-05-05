@@ -197,7 +197,8 @@ ssize_t cuobj_srv_handle_put(
     uint64_t    remote_buf_start,
     size_t      size,
     const char *rdma_descr,
-    uint16_t    channel)
+    uint16_t    channel,
+    int        *status)
 {
     CuObjSrvHandle *h   = static_cast<CuObjSrvHandle *>(handle);
     CuObjSrvBuffer *buf = static_cast<CuObjSrvBuffer *>(buf_handle);
@@ -211,6 +212,7 @@ ssize_t cuobj_srv_handle_put(
         channel,
         /*local_offset=*/0,
         &wc_status);
+    if (status) *status = static_cast<int>(wc_status);
     return n;
 }
 
@@ -263,18 +265,23 @@ ssize_t cuobj_srv_handle_get(
     uint64_t    remote_buf_start,
     size_t      size,
     const char *rdma_descr,
-    uint16_t    channel)
+    uint16_t    channel,
+    int        *status)
 {
     CuObjSrvHandle *h   = static_cast<CuObjSrvHandle *>(handle);
     CuObjSrvBuffer *buf = static_cast<CuObjSrvBuffer *>(buf_handle);
-    return h->server->handleGetObject(
+    ibv_wc_status wc_status = IBV_WC_SUCCESS;
+    ssize_t n = h->server->handleGetObject(
         std::string(key),
         buf->rbuf,
         remote_buf_start,
         size,
         std::string(rdma_descr),
         channel,
-        /*local_offset=*/0);
+        /*local_offset=*/0,
+        &wc_status);
+    if (status) *status = static_cast<int>(wc_status);
+    return n;
 }
 
 /**
