@@ -158,6 +158,27 @@ void cuobj_srv_deregister_free(void *handle, void *buf_handle)
 }
 
 /**
+ * Register an existing host buffer for RDMA.
+ * @return opaque rdma_buffer* handle, or NULL on failure.
+ *         Caller must release with cuobj_srv_deregister_buffer().
+ */
+void *cuobj_srv_register_buffer(void *handle, void *ptr, size_t size)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    return static_cast<void *>(h->server->registerBuffer(ptr, size));
+}
+
+/**
+ * Deregister a buffer registered via cuobj_srv_register_buffer().
+ * Does NOT free the host memory.
+ */
+void cuobj_srv_deregister_buffer(void *handle, void *rbuf)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    h->server->deRegisterBuffer(static_cast<struct rdma_buffer *>(rbuf));
+}
+
+/**
  * Return the raw data pointer for a CuObjSrvBuffer.
  * Use this to copy data into/out of the buffer before/after RDMA operations.
  */
@@ -314,6 +335,33 @@ ssize_t cuobj_srv_handle_get_async(
         /*local_offset=*/0,
         /*status=*/nullptr,
         async_handle);
+}
+
+/**
+ * Submit an async PUT using a raw rbuf handle (not a CuObjSrvBuffer).
+ */
+ssize_t cuobj_srv_handle_put_async_rbuf(
+    void *handle, const char *key, void *rbuf,
+    uint64_t remote_start, size_t size, const char *descr,
+    uint16_t channel, void *async_handle)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    return h->server->handlePutObject(
+        std::string(key), static_cast<struct rdma_buffer *>(rbuf),
+        remote_start, size, std::string(descr), channel,
+        /*local_offset=*/0, /*status=*/nullptr, async_handle);
+}
+
+ssize_t cuobj_srv_handle_get_async_rbuf(
+    void *handle, const char *key, void *rbuf,
+    uint64_t remote_start, size_t size, const char *descr,
+    uint16_t channel, void *async_handle)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    return h->server->handleGetObject(
+        std::string(key), static_cast<struct rdma_buffer *>(rbuf),
+        remote_start, size, std::string(descr), channel,
+        /*local_offset=*/0, /*status=*/nullptr, async_handle);
 }
 
 /**

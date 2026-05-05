@@ -213,6 +213,14 @@ extern "C" {
     /// Deregister and free a buffer created by [`cuobj_srv_alloc_register`].
     pub fn cuobj_srv_deregister_free(handle: *mut c_void, buf: *mut c_void);
 
+    /// Register an existing host buffer for RDMA.
+    /// Returns an opaque rdma_buffer* handle, or null on failure.
+    pub fn cuobj_srv_register_buffer(handle: *mut c_void, ptr: *mut c_void, size: usize) -> *mut c_void;
+
+    /// Deregister a buffer registered via [`cuobj_srv_register_buffer`].
+    /// Does NOT free the host memory.
+    pub fn cuobj_srv_deregister_buffer(handle: *mut c_void, rbuf: *mut c_void);
+
     /// Return the raw host data pointer inside a `CuObjSrvBuffer`.
     ///
     /// Use this to copy data into or out of the buffer around RDMA operations.

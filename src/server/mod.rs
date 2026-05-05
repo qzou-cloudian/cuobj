@@ -46,9 +46,10 @@ use std::sync::Arc;
 pub use cuobj_sys::CuObjAsyncEvent;
 use cuobj_sys::{
     cuobj_srv_alloc_channel, cuobj_srv_alloc_register, cuobj_srv_buf_data, cuobj_srv_buf_size,
-    cuobj_srv_create, cuobj_srv_deregister_free, cuobj_srv_destroy, cuobj_srv_free_channel,
-    cuobj_srv_handle_get, cuobj_srv_handle_get_async, cuobj_srv_handle_put,
+    cuobj_srv_create, cuobj_srv_deregister_buffer, cuobj_srv_deregister_free, cuobj_srv_destroy,
+    cuobj_srv_free_channel, cuobj_srv_handle_get, cuobj_srv_handle_get_async, cuobj_srv_handle_put,
     cuobj_srv_handle_put_async, cuobj_srv_is_connected, cuobj_srv_poll,
+    cuobj_srv_register_buffer,
     cuobj_srv_set_telem_flags, cuobj_srv_setup_telemetry, cuobj_srv_shutdown_telemetry,
     ibv_wc_status,
 };
@@ -434,6 +435,21 @@ impl CuObjServer {
     }
 
     // ── Buffer management ────────────────────────────────────────────────────
+
+    /// Register an existing host buffer for RDMA.
+    ///
+    /// Returns an opaque `*mut c_void` handle for deregistration.
+    /// Does NOT free the host memory on deregister — caller owns that.
+    pub fn register_existing_buffer(&self, ptr: *mut u8, size: usize) -> Option<*mut c_void> {
+        let rbuf = unsafe { cuobj_srv_register_buffer(self.handle, ptr as *mut c_void, size) };
+        if rbuf.is_null() { None } else { Some(rbuf) }
+    }
+
+    /// Deregister a buffer registered via [`register_existing_buffer`](Self::register_existing_buffer).
+    /// Does NOT free the host memory.
+    pub fn deregister_buffer(&self, rbuf: *mut c_void) {
+        unsafe { cuobj_srv_deregister_buffer(self.handle, rbuf) };
+    }
 
     /// Allocate a 4 KiB-aligned host buffer of `size` bytes and register it
     /// with the RDMA fabric.
