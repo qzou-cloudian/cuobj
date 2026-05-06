@@ -51,7 +51,7 @@ use cuobj_sys::{
     cuobj_srv_handle_put_async, cuobj_srv_is_connected, cuobj_srv_poll,
     cuobj_srv_register_buffer,
     cuobj_srv_set_telem_flags, cuobj_srv_setup_telemetry, cuobj_srv_shutdown_telemetry,
-    ibv_wc_status,
+    ibv_wc_status, wc_status,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,28 +65,28 @@ pub struct WcStatus(pub ibv_wc_status);
 impl std::fmt::Display for WcStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self.0 {
-            0  => "SUCCESS",
-            1  => "LOC_LEN_ERR",
-            2  => "LOC_QP_OP_ERR",
-            3  => "LOC_EEC_OP_ERR",
-            4  => "LOC_PROT_ERR",
-            5  => "WR_FLUSH_ERR",
-            6  => "MW_BIND_ERR",
-            7  => "BAD_RESP_ERR",
-            8  => "LOC_ACCESS_ERR",
-            9  => "REM_INV_REQ_ERR",
-            10 => "REM_ACCESS_ERR",
-            11 => "REM_OP_ERR",
-            12 => "RETRY_EXC_ERR",
-            13 => "RNR_RETRY_EXC_ERR",
-            14 => "LOC_RDD_VIOL_ERR",
-            15 => "REM_INV_RD_REQ_ERR",
-            16 => "REM_ABORT_ERR",
-            17 => "INV_EECN_ERR",
-            18 => "INV_EEC_STATE_ERR",
-            19 => "FATAL_ERR",
-            20 => "RESP_TIMEOUT_ERR",
-            21 => "GENERAL_ERR",
+            wc_status::SUCCESS            => "SUCCESS",
+            wc_status::LOC_LEN_ERR        => "LOC_LEN_ERR",
+            wc_status::LOC_QP_OP_ERR      => "LOC_QP_OP_ERR",
+            wc_status::LOC_EEC_OP_ERR     => "LOC_EEC_OP_ERR",
+            wc_status::LOC_PROT_ERR       => "LOC_PROT_ERR",
+            wc_status::WR_FLUSH_ERR       => "WR_FLUSH_ERR",
+            wc_status::MW_BIND_ERR        => "MW_BIND_ERR",
+            wc_status::BAD_RESP_ERR       => "BAD_RESP_ERR",
+            wc_status::LOC_ACCESS_ERR     => "LOC_ACCESS_ERR",
+            wc_status::REM_INV_REQ_ERR    => "REM_INV_REQ_ERR",
+            wc_status::REM_ACCESS_ERR     => "REM_ACCESS_ERR",
+            wc_status::REM_OP_ERR         => "REM_OP_ERR",
+            wc_status::RETRY_EXC_ERR      => "RETRY_EXC_ERR",
+            wc_status::RNR_RETRY_EXC_ERR  => "RNR_RETRY_EXC_ERR",
+            wc_status::LOC_RDD_VIOL_ERR   => "LOC_RDD_VIOL_ERR",
+            wc_status::REM_INV_RD_REQ_ERR => "REM_INV_RD_REQ_ERR",
+            wc_status::REM_ABORT_ERR      => "REM_ABORT_ERR",
+            wc_status::INV_EECN_ERR       => "INV_EECN_ERR",
+            wc_status::INV_EEC_STATE_ERR  => "INV_EEC_STATE_ERR",
+            wc_status::FATAL_ERR          => "FATAL_ERR",
+            wc_status::RESP_TIMEOUT_ERR   => "RESP_TIMEOUT_ERR",
+            wc_status::GENERAL_ERR        => "GENERAL_ERR",
             _  => return write!(f, "{}", self.0),
         };
         write!(f, "{name} ({})", self.0)
@@ -348,6 +348,8 @@ impl CuObjServer {
     /// * `use_otel` — `true` for OpenTelemetry backend, `false` for ostream.
     /// * `log_file` — optional file path for ostream mode; `None` uses stdout.
     pub fn setup_telemetry(use_otel: bool, log_file: Option<&str>) {
+        // Panics if `log_file` contains an interior NUL byte (path strings
+        // never should, so this is acceptable in practice).
         let file_path = log_file.map(|s| std::ffi::CString::new(s).unwrap());
         let file_ptr = file_path
             .as_ref()
@@ -409,8 +411,6 @@ impl CuObjServer {
     ///
     /// Fills up to `events.len()` entries and returns the number completed.
     /// Non-blocking — returns 0 if no completions are ready yet.
-    ///
-    /// # Errors
     ///
     /// # Errors
     ///
@@ -1035,28 +1035,28 @@ mod tests {
     #[test]
     fn wc_status_display_known() {
         let names = [
-            (0, "SUCCESS"),
-            (1, "LOC_LEN_ERR"),
-            (2, "LOC_QP_OP_ERR"),
-            (3, "LOC_EEC_OP_ERR"),
-            (4, "LOC_PROT_ERR"),
-            (5, "WR_FLUSH_ERR"),
-            (6, "MW_BIND_ERR"),
-            (7, "BAD_RESP_ERR"),
-            (8, "LOC_ACCESS_ERR"),
-            (9, "REM_INV_REQ_ERR"),
-            (10, "REM_ACCESS_ERR"),
-            (11, "REM_OP_ERR"),
-            (12, "RETRY_EXC_ERR"),
-            (13, "RNR_RETRY_EXC_ERR"),
-            (14, "LOC_RDD_VIOL_ERR"),
-            (15, "REM_INV_RD_REQ_ERR"),
-            (16, "REM_ABORT_ERR"),
-            (17, "INV_EECN_ERR"),
-            (18, "INV_EEC_STATE_ERR"),
-            (19, "FATAL_ERR"),
-            (20, "RESP_TIMEOUT_ERR"),
-            (21, "GENERAL_ERR"),
+            (wc_status::SUCCESS, "SUCCESS"),
+            (wc_status::LOC_LEN_ERR, "LOC_LEN_ERR"),
+            (wc_status::LOC_QP_OP_ERR, "LOC_QP_OP_ERR"),
+            (wc_status::LOC_EEC_OP_ERR, "LOC_EEC_OP_ERR"),
+            (wc_status::LOC_PROT_ERR, "LOC_PROT_ERR"),
+            (wc_status::WR_FLUSH_ERR, "WR_FLUSH_ERR"),
+            (wc_status::MW_BIND_ERR, "MW_BIND_ERR"),
+            (wc_status::BAD_RESP_ERR, "BAD_RESP_ERR"),
+            (wc_status::LOC_ACCESS_ERR, "LOC_ACCESS_ERR"),
+            (wc_status::REM_INV_REQ_ERR, "REM_INV_REQ_ERR"),
+            (wc_status::REM_ACCESS_ERR, "REM_ACCESS_ERR"),
+            (wc_status::REM_OP_ERR, "REM_OP_ERR"),
+            (wc_status::RETRY_EXC_ERR, "RETRY_EXC_ERR"),
+            (wc_status::RNR_RETRY_EXC_ERR, "RNR_RETRY_EXC_ERR"),
+            (wc_status::LOC_RDD_VIOL_ERR, "LOC_RDD_VIOL_ERR"),
+            (wc_status::REM_INV_RD_REQ_ERR, "REM_INV_RD_REQ_ERR"),
+            (wc_status::REM_ABORT_ERR, "REM_ABORT_ERR"),
+            (wc_status::INV_EECN_ERR, "INV_EECN_ERR"),
+            (wc_status::INV_EEC_STATE_ERR, "INV_EEC_STATE_ERR"),
+            (wc_status::FATAL_ERR, "FATAL_ERR"),
+            (wc_status::RESP_TIMEOUT_ERR, "RESP_TIMEOUT_ERR"),
+            (wc_status::GENERAL_ERR, "GENERAL_ERR"),
         ];
         for (code, name) in names {
             let s = WcStatus(code).to_string();

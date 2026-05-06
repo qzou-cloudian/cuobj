@@ -62,6 +62,8 @@ void *cuobj_srv_create(const char *ip, unsigned short port)
     CuObjSrvHandle *h = new (std::nothrow) CuObjSrvHandle();
     if (!h) return nullptr;
 
+    // CUOBJ_PROTO_RDMA_DC_V1 (1001) — the only protocol version supported by
+    // the current cuObj SDK.  Must match the client's protocol constant.
     h->server = new (std::nothrow) cuObjServer(ip, port, CUOBJ_PROTO_RDMA_DC_V1);
     if (!h->server) {
         delete h;

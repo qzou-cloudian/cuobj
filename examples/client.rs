@@ -5,6 +5,10 @@
 //!
 //! Run with:
 //!   cargo run --example client --features client
+//!
+//! If the binary was built without an RPATH, set the library search path:
+//!   LD_LIBRARY_PATH=/usr/local/cuda-13.2/targets/x86_64-linux/lib \
+//!     cargo run --example client --features client
 
 #[cfg(feature = "client")]
 fn main() {

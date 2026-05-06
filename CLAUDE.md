@@ -25,6 +25,18 @@ cargo build --example pingpong --features client,server
 cargo test --features client,server
 ```
 
+**Runtime library paths**: The build embeds RPATH entries for `libcuobjclient.so`
+(CUDA SDK) and `libcuobjserver.so` (system).  If you use a binary built before
+RPATH was added, set:
+```sh
+export LD_LIBRARY_PATH=/usr/local/cuda-13.2/targets/x86_64-linux/lib
+```
+Do NOT point `LD_LIBRARY_PATH` at `/usr/local/lib` — that directory contains
+manually-installed cuObj builds that are incompatible with Ubuntu 24.04's glibc
+and will crash with a `malloc` assertion during server init.  The working
+`libcuobjserver.so` lives in `/lib/x86_64-linux-gnu` (installed by the system
+package).
+
 Build requires the NVIDIA cuObj SDK. Set `CUOBJ_ROOT_DIR` to the SDK root, or `CUOBJ_LIB_DIR` to the directory containing `libcuobjclient.so`. `libcuobjserver.so` is auto-located in `/usr/lib` or `/usr/local/lib`.
 
 ## Architecture

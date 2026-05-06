@@ -399,7 +399,7 @@ impl CuObjClient {
     pub fn register(&self, ptr: *mut u8, size: usize) -> Result<(), CuObjClientError> {
         let addr = ptr as usize;
         {
-            let mut reg = self.registered.lock().unwrap();
+            let mut reg = self.registered.lock().expect("CuObjClient mutex poisoned");
             if reg.contains(&addr) {
                 return Err(CuObjClientError::AlreadyRegistered { ptr: addr });
             }
@@ -411,7 +411,7 @@ impl CuObjClient {
             cuobj_client_mem_get_descriptor(self.handle.0,ptr as *mut c_void, size)
         };
         if rc != CU_OBJ_SUCCESS {
-            self.registered.lock().unwrap().remove(&addr);
+            self.registered.lock().expect("CuObjClient mutex poisoned").remove(&addr);
             return Err(CuObjClientError::RegistrationFailed {
                 ptr: addr,
                 size,
@@ -426,7 +426,7 @@ impl CuObjClient {
     /// If `ptr` was not registered, this is a no-op and returns `Ok(())`.
     pub fn deregister(&self, ptr: *mut u8) -> Result<(), CuObjClientError> {
         let addr = ptr as usize;
-        let was_registered = self.registered.lock().unwrap().remove(&addr);
+        let was_registered = self.registered.lock().expect("CuObjClient mutex poisoned").remove(&addr);
         if !was_registered {
             return Ok(());
         }
@@ -517,6 +517,8 @@ impl CuObjClient {
     /// * `use_otel` — `true` for OpenTelemetry backend, `false` for ostream.
     /// * `log_file` — optional file path for ostream mode; `None` uses stdout.
     pub fn setup_telemetry(use_otel: bool, log_file: Option<&str>) {
+        // Panics if `log_file` contains an interior NUL byte (path strings
+        // never should, so this is acceptable in practice).
         let file_path = log_file.map(|s| std::ffi::CString::new(s).unwrap());
         let file_ptr = file_path
             .as_ref()
@@ -578,7 +580,7 @@ impl Drop for CuObjClient {
         let ptrs: Vec<usize> = self
             .registered
             .lock()
-            .unwrap()
+            .expect("CuObjClient mutex poisoned")
             .iter()
             .copied()
             .collect();
@@ -599,7 +601,7 @@ impl std::fmt::Debug for CuObjClient {
             .field("handle", &self.handle.0)
             .field(
                 "registrations",
-                &self.registered.lock().map(|g| g.len()).unwrap_or(0),
+                &self.registered.lock().map(|g| g.len()).unwrap_or(usize::MAX),
             )
             .finish()
     }

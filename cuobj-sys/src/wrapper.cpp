@@ -45,10 +45,15 @@ void *cuobj_client_create(void)
     CuObjClientWrapper *w = new (std::nothrow) CuObjClientWrapper();
     if (!w) return nullptr;
 
-    // No-op callbacks – never called on the token-based path.
+    // No-op callbacks — never called on the token-based path.  The cuObj SDK
+    // uses these callbacks only for the callback-driven I/O path; the
+    // token-based workflow (cuMemObjGetRDMAToken / cuMemObjPutRDMAToken)
+    // bypasses them entirely.
     w->ops.get = nullptr;
     w->ops.put = nullptr;
 
+    // CUOBJ_PROTO_RDMA_DC_V1 (1001) — the only protocol version supported by
+    // the current cuObj SDK.  Server must use the same protocol constant.
     w->client = new (std::nothrow) cuObjClient(w->ops, CUOBJ_PROTO_RDMA_DC_V1);
     if (!w->client) {
         delete w;

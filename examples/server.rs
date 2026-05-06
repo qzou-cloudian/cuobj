@@ -5,6 +5,12 @@
 //!
 //! Run with:
 //!   cargo run --example server --features server
+//!
+//! If the binary was built without an RPATH, the library search path may be
+//! needed for `libcuobjclient.so` (the server links both libraries):
+//!   LD_LIBRARY_PATH=/usr/local/cuda-13.2/targets/x86_64-linux/lib \
+//!     RDMA_IP=10.50.132.250 RDMA_PORT=4421 \
+//!     cargo run --example server --features server
 
 #[cfg(feature = "server")]
 fn main() {

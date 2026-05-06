@@ -21,7 +21,7 @@ The cuObj SDK follows an S3-like PUT/GET object model. RDMA descriptors are exch
 │   src/client/mod.rs            src/server/mod.rs         │
 │   CuObjClient                  CuObjServer               │
 │   RegisteredBuffer             AllocatedBuffer           │
-│   RdmaToken                    PersistentBuffer          │
+│   CuObjRdmaToken               PersistentBuffer          │
 │   MemoryType / OpType          Channel                   │
 └──────────────────┬─────────────────────┬─────────────────┘
                    │  unsafe FFI calls   │
@@ -72,6 +72,24 @@ The build locates the cuObj headers and shared libraries via:
 | `CUOBJ_LIB_DIR` | Same as `CUOBJ_ROOT_DIR` | Override library search path |
 
 `libcuobjserver.so` is searched in `/usr/lib/x86_64-linux-gnu`, `/usr/lib`, and `/usr/local/lib`.
+
+### Runtime library paths
+
+Builds produced after the addition of RPATH embedding (see `build.rs`) do not need
+`LD_LIBRARY_PATH`.  For builds without an embedded RPATH, set:
+
+```sh
+export LD_LIBRARY_PATH=/usr/local/cuda-13.2/targets/x86_64-linux/lib
+```
+
+The server links both `libcuobjserver.so` and `libcuobjclient.so`; only the
+latter requires the extra search path (it ships with the CUDA SDK, not the OS).
+The system `libcuobjserver.so` in `/lib/x86_64-linux-gnu` is on the default
+linker search path and does not need an override.
+
+**Note:** `/usr/local/lib` may contain manually-installed cuObj builds that are
+incompatible with the running glibc (observed as a glibc `malloc` assertion
+crash).  Point `LD_LIBRARY_PATH` to the CUDA SDK library directory instead.
 
 ## Usage
 
@@ -153,6 +171,9 @@ RDMA_IP=<nic-ip> RDMA_PORT=4421 ./target/debug/examples/pingpong server
 ```
 
 The client registers two buffers (ping for PUT, pong for GET), sends their RDMA tokens over a TCP control connection, and verifies the pong buffer contains the expected data after the server completes both transfers.
+
+If you see an error about missing `libcuobjclient.so.1`, see the
+[Runtime library paths](#runtime-library-paths) section above.
 
 ## API Overview
 

@@ -23,9 +23,10 @@
 //! | `CUOBJ_MEMORY_SYSTEM`       | 0     | Regular host memory          |
 //! | `CUOBJ_MEMORY_CUDA_MANAGED` | 1     | CUDA managed memory          |
 //! | `CUOBJ_MEMORY_CUDA_DEVICE`  | 2     | CUDA device memory           |
-//! | `CUOBJ_MEMORY_UNKNOWN`      | 3     | Pointer type could not be determined |
+//! | `CUOBJ_MEMORY_UNKNOWN`      | 3     | Pointer type undetermined    |
 //! | `CUOBJ_MEMORY_INVALID`      | 4     | Invalid / null pointer       |
 //! | `CU_OBJ_SUCCESS`            | 0     | Success return code          |
+//! | `CUOBJ_PROTO_RDMA_DC_V1`    | 1001  | RDMA DC protocol version 1   |
 
 #![allow(non_camel_case_types)]
 
@@ -61,6 +62,13 @@ pub const CUOBJ_MEMORY_INVALID: i32 = 4;
 
 #[cfg(feature = "client")]
 pub const CU_OBJ_SUCCESS: i32 = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cuObjProto_t constant (used by both client and server wrappers)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub const CUOBJ_PROTO_RDMA_DC_V1: i32 = 1001;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // cuObjClient FFI (wrapper.cpp → libcuobjclient.so)
@@ -159,6 +167,34 @@ extern "C" {
 /// preserved as their raw integer.
 #[cfg(feature = "server")]
 pub type ibv_wc_status = i32;
+
+/// Named `ibv_wc_status` constants.
+#[cfg(feature = "server")]
+pub mod wc_status {
+    use super::ibv_wc_status;
+    pub const SUCCESS: ibv_wc_status            = 0;
+    pub const LOC_LEN_ERR: ibv_wc_status        = 1;
+    pub const LOC_QP_OP_ERR: ibv_wc_status      = 2;
+    pub const LOC_EEC_OP_ERR: ibv_wc_status     = 3;
+    pub const LOC_PROT_ERR: ibv_wc_status       = 4;
+    pub const WR_FLUSH_ERR: ibv_wc_status       = 5;
+    pub const MW_BIND_ERR: ibv_wc_status        = 6;
+    pub const BAD_RESP_ERR: ibv_wc_status       = 7;
+    pub const LOC_ACCESS_ERR: ibv_wc_status     = 8;
+    pub const REM_INV_REQ_ERR: ibv_wc_status    = 9;
+    pub const REM_ACCESS_ERR: ibv_wc_status     = 10;
+    pub const REM_OP_ERR: ibv_wc_status         = 11;
+    pub const RETRY_EXC_ERR: ibv_wc_status      = 12;
+    pub const RNR_RETRY_EXC_ERR: ibv_wc_status  = 13;
+    pub const LOC_RDD_VIOL_ERR: ibv_wc_status   = 14;
+    pub const REM_INV_RD_REQ_ERR: ibv_wc_status = 15;
+    pub const REM_ABORT_ERR: ibv_wc_status      = 16;
+    pub const INV_EECN_ERR: ibv_wc_status       = 17;
+    pub const INV_EEC_STATE_ERR: ibv_wc_status  = 18;
+    pub const FATAL_ERR: ibv_wc_status          = 19;
+    pub const RESP_TIMEOUT_ERR: ibv_wc_status   = 20;
+    pub const GENERAL_ERR: ibv_wc_status        = 21;
+}
 
 /// Completion event returned by [`cuobj_srv_poll`].
 ///
