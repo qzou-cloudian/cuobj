@@ -3,7 +3,7 @@
 
 [package]
 name          = "cuobj-sys"
-version       = "0.1.0"
+version       = "0.2.0"
 edition       = "2021"
 description   = "Raw FFI bindings and C++ shims for the NVIDIA cuObj SDK (libcuobjclient + libcuobjserver)"
 license       = "Apache-2.0"

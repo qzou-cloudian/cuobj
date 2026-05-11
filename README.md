@@ -9,6 +9,7 @@ The cuObj SDK follows an S3-like PUT/GET object model. RDMA descriptors are exch
 - **Client side** — register CPU or CUDA memory buffers with the RDMA fabric and generate PUT/GET token descriptors.
 - **Server side** — receive tokens and perform zero-copy RDMA transfers (`RDMA_READ` for PUT, `RDMA_WRITE` for GET).
 - **RAII resource management** — registered buffers, channels, and tokens are automatically freed on drop.
+- **Lifetime-free buffer guards** — `RegisteredBuffer`, `AllocatedBuffer`, `Channel`, and `PersistentBuffer` hold `Arc` references instead of borrows, so they can be stored in structs and held across `async` await points.
 - **Two API tiers** — high-level helpers (`receive_put` / `send_get`) for simple use cases, and low-level buffer/channel control for advanced scenarios.
 - **Thread safe** — `CuObjClient` and `CuObjServer` are `Send + Sync`.
 - **Feature flags** — compile only what you need (`client`, `server`, or both).
@@ -53,13 +54,13 @@ Add `cuobj` to your `Cargo.toml` with the features you need:
 ```toml
 [dependencies]
 # Client only
-cuobj = { version = "0.1", features = ["client"] }
+cuobj = { version = "0.2", features = ["client"] }
 
 # Server only
-cuobj = { version = "0.1", features = ["server"] }
+cuobj = { version = "0.2", features = ["server"] }
 
 # Both
-cuobj = { version = "0.1", features = ["client", "server"] }
+cuobj = { version = "0.2", features = ["client", "server"] }
 ```
 
 ### Environment variables
@@ -68,8 +69,14 @@ The build locates the cuObj headers and shared libraries via:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CUOBJ_ROOT_DIR` | `/usr/local/cuda-13.2/targets/x86_64-linux` | cuObj SDK root (headers + client lib) |
-| `CUOBJ_LIB_DIR` | Same as `CUOBJ_ROOT_DIR` | Override library search path |
+| `CUOBJ_ROOT_DIR` | See below | Override SDK root (headers + client lib) |
+| `CUOBJ_LIB_DIR` | — | Override library search path for `libcuobjclient.so` |
+
+When `CUOBJ_ROOT_DIR` is not set, the build searches these paths in order:
+
+1. `/usr/local/cuda-13.2/targets/x86_64-linux`
+2. `/usr/local/cuda/targets/x86_64-linux`
+3. `/usr/local/cuda`
 
 `libcuobjserver.so` is searched in `/usr/lib/x86_64-linux-gnu`, `/usr/lib`, and `/usr/local/lib`.
 
@@ -105,10 +112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Allocate a buffer and register it with the RDMA fabric.
     let mut data = vec![0u8; 4 * 1024 * 1024]; // 4 MiB
 
-    // `register_raii` returns a guard that deregisters on drop.
-    let buf = client.register_raii(data.as_mut_ptr(), data.len())?;
+    // `register_buffer` returns a guard that deregisters on drop.
+    let buf = client.register_buffer(data.as_mut_ptr(), data.len())?;
 
-    println!("max transfer size: {}", buf.max_transfer_size());
+    println!("max transfer size: {}", buf.max_transfer_size().unwrap_or(0));
 
     // Generate token strings to hand to the server (e.g., via HTTP header).
     let put_token = buf.put_token(0, buf.size())?;  // server will READ from us
@@ -183,17 +190,38 @@ If you see an error about missing `libcuobjclient.so.1`, see the
 |---|---|
 | `CuObjClient::new()` | Create client; returns error if RDMA is unavailable |
 | `is_connected()` | Check RDMA fabric connectivity |
-| `register_raii(ptr, size)` | Register buffer; returns `RegisteredBuffer` RAII guard |
+| `register_buffer(ptr, size)` | Register buffer; returns `RegisteredBuffer` RAII guard |
+| `register(ptr, size)` / `deregister(ptr)` | Low-level manual registration |
+| `put_token(ptr, size, offset)` | Generate PUT token for a manually registered buffer |
+| `get_token(ptr, size, offset)` | Generate GET token for a manually registered buffer |
 | `memory_type(ptr)` | Classify a pointer: `System`, `CudaManaged`, `CudaDevice`, … |
 | `is_rdma_suitable(ptr)` | Returns `true` for RDMA-compatible memory types |
 
-**`RegisteredBuffer`** (returned by `register_raii`):
+**Free functions** (no `CuObjClient` instance required):
+
+| Function | Description |
+|---|---|
+| `cuobj::memory_type(ptr)` | Classify pointer memory type |
+| `cuobj::is_rdma_suitable(ptr)` | Check RDMA suitability |
+
+**`RegisteredBuffer`** (returned by `register_buffer`):
 
 | Method | Description |
 |---|---|
 | `put_token(offset, len)` | Generate PUT descriptor (server will RDMA_READ) |
 | `get_token(offset, len)` | Generate GET descriptor (server will RDMA_WRITE) |
 | `max_transfer_size()` | Maximum bytes per RDMA callback |
+| `as_slice()` / `as_mut_slice()` | View buffer contents |
+| `Deref<[u8]>` / `DerefMut` | Slice indexing (`&buf[..]`, `buf[..n].copy_from_slice(...)`) |
+
+**`CuObjRdmaToken`** (returned by `put_token` / `get_token`):
+
+| Method / Trait | Description |
+|---|---|
+| `as_str()` / `as_bytes()` | View descriptor without consuming |
+| `into_string()` / `into_bytes()` | Consume and copy descriptor |
+| `Display` / `AsRef<str>` / `AsRef<[u8]>` | Standard conversions |
+| `From<CuObjRdmaToken>` for `String` / `Vec<u8>` | Idiomatic `into()` |
 
 ### `CuObjServer` (feature `server`)
 
@@ -201,12 +229,26 @@ If you see an error about missing `libcuobjclient.so.1`, see the
 |---|---|
 | `CuObjServer::new(ip, port)` | Bind RDMA server to NIC IP:port |
 | `is_connected()` | Check RDMA fabric connectivity |
-| `receive_put(key, start, size, token)` | RDMA_READ from client → `Vec<u8>` |
-| `send_get(key, start, data, token)` | RDMA_WRITE `data` → client memory |
+| `receive_put(key, offset, size, token)` | RDMA_READ from client → `Vec<u8>` |
+| `send_get(key, offset, data, token)` | RDMA_WRITE `data` → client memory |
 | `alloc_buffer(size)` | Allocate RDMA-registered host buffer (low-level) |
 | `alloc_channel()` | Allocate a channel ID for one concurrent transfer (low-level) |
-| `handle_put(...)` | Low-level RDMA_READ into a pre-allocated buffer |
-| `handle_get(...)` | Low-level RDMA_WRITE from a pre-allocated buffer |
+| `handle_put(key, buf, offset, size, token, channel)` | Low-level RDMA_READ |
+| `handle_get(key, buf, offset, size, token, channel)` | Low-level RDMA_WRITE |
+| `free_channel_by_id(id)` | Free a channel whose `Channel` guard was leaked |
+| `poll_channel(events, channel_id)` | Harvest async operation completions |
+
+**`PersistentBuffer`** (for buffer pools; constructed from `Arc<CuObjServer>`):
+
+| Method | Description |
+|---|---|
+| `PersistentBuffer::new(server, size)` | Allocate and register; buffer lives until dropped |
+| `handle_put(key, offset, size, token, channel_id)` | RDMA_READ into this buffer |
+| `handle_get(key, offset, size, token, channel_id)` | RDMA_WRITE from this buffer |
+| `submit_put_async(...)` | Submit async RDMA_READ (`unsafe`) |
+| `submit_get_async(...)` | Submit async RDMA_WRITE (`unsafe`) |
+| `as_slice()` / `as_mut_slice()` | View buffer contents |
+| `Deref<[u8]>` / `DerefMut` | Slice indexing |
 
 ## License
 

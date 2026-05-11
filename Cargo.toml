@@ -1,6 +1,6 @@
 [package]
 name        = "cuobj"
-version     = "0.1.0"
+version     = "0.2.0"
 edition     = "2021"
 description = "Safe Rust bindings for the NVIDIA cuObj SDK (client, server)"
 license     = "Apache-2.0"
@@ -18,5 +18,3 @@ server      = ["dep:cuobj-sys", "cuobj-sys/server"]
 cuobj-sys = { path = "./cuobj-sys", optional = true }
 thiserror  = "1"
 
-[dev-dependencies]
-tempfile = "3"

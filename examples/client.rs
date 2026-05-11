@@ -27,7 +27,7 @@ fn main() {
     // Allocate a 4 MiB buffer and register it.
     let mut buf = vec![0u8; 4 * 1024 * 1024];
     let reg = client
-        .register_raii(buf.as_mut_ptr(), buf.len())
+        .register_buffer(buf.as_mut_ptr(), buf.len())
         .expect("registration failed");
 
     println!(

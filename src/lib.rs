@@ -5,10 +5,10 @@
 //!
 //! Enable features to choose which components to include:
 //!
-//! | Feature  | What it provides                     |
-//! |----------|--------------------------------------|
-//! | `client` | [`CuObjClient`], RDMA token generation |
-//! | `server` | [`CuObjServer`], RDMA PUT/GET operations |
+//! | Feature  | What it provides                                        |
+//! |----------|---------------------------------------------------------|
+//! | `client` | [`CuObjClient`], [`RegisteredBuffer`], token generation |
+//! | `server` | [`CuObjServer`], [`PersistentBuffer`], RDMA transfers   |
 
 #[cfg(feature = "client")]
 pub mod client;
@@ -19,7 +19,13 @@ pub mod server;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "client")]
-pub use client::{CuObjClient, CuObjClientError, CuObjRdmaToken, MemoryType, OpType, RegisteredBuffer};
+pub use client::{
+    is_rdma_suitable, memory_type,
+    CuObjClient, CuObjClientError, CuObjRdmaToken, MemoryType, OpType, RegisteredBuffer,
+};
 
 #[cfg(feature = "server")]
-pub use server::{AllocatedBuffer, Channel, CuObjAsyncEvent, CuObjServer, CuObjServerError, PersistentBuffer, WcStatus};
+pub use server::{
+    AllocatedBuffer, Channel, CuObjAsyncEvent, CuObjServer, CuObjServerError,
+    PersistentBuffer, WcStatus,
+};

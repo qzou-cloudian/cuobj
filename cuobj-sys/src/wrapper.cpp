@@ -135,6 +135,70 @@ int cuobj_client_mem_put_rdma_token(void *handle, char *desc_str)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// cuObjGet / cuObjPut — direct I/O via ops callbacks
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Retrieve the user context from a cuobj callback handle.
+ *
+ * Called from within an ops.get/put callback: `handle` is the opaque argument
+ * passed by cuObj, and the return value is the `ctx` pointer that was supplied
+ * to cuObjGet/cuObjPut.
+ */
+void *cuobj_client_get_ctx_from_handle(const void *cuobj_handle)
+{
+    return cuObjClient::getCtx(cuobj_handle);
+}
+
+/**
+ * Create a cuObjClient whose ops.get callback is set to `get_cb`.
+ *
+ * cuObjGet will invoke `get_cb` with the RDMA descriptor string; the callback
+ * is responsible for forwarding it to the server via the control path (e.g.
+ * HTTP) and waiting until the RDMA transfer completes.
+ *
+ * The `put` callback is left null (PUT path not wired up here).
+ *
+ * @return opaque wrapper handle, or NULL on allocation failure.
+ */
+void *cuobj_client_create_with_get_cb(
+    ssize_t (*get_cb)(const void *, char *, size_t, loff_t,
+                      const cufileRDMAInfo_t *))
+{
+    CuObjClientWrapper *w = new (std::nothrow) CuObjClientWrapper();
+    if (!w) return nullptr;
+
+    w->ops.get = get_cb;
+    w->ops.put = nullptr;
+
+    w->client = new (std::nothrow) cuObjClient(w->ops, CUOBJ_PROTO_RDMA_DC_V1);
+    if (!w->client) {
+        delete w;
+        return nullptr;
+    }
+    return static_cast<void *>(w);
+}
+
+/**
+ * Perform a GET via cuObjClient::cuObjGet.
+ *
+ * @param handle     Wrapper handle (from cuobj_client_create_with_get_cb).
+ * @param ctx        User context forwarded to the ops.get callback.
+ * @param ptr        Destination buffer (must be registered via
+ *                   cuobj_client_mem_get_descriptor).
+ * @param size       Number of bytes to read.
+ * @param offset     Object byte offset.
+ * @param buf_offset Buffer byte offset.
+ * @return Bytes transferred (≥ 0) on success, or -1 on failure.
+ */
+ssize_t cuobj_client_get(void *handle, void *ctx, void *ptr,
+                          size_t size, loff_t offset, loff_t buf_offset)
+{
+    CuObjClientWrapper *w = static_cast<CuObjClientWrapper *>(handle);
+    return w->client->cuObjGet(ctx, ptr, size, offset, buf_offset);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Utility
 // ─────────────────────────────────────────────────────────────────────────────
 

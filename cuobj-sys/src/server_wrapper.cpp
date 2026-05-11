@@ -340,33 +340,6 @@ ssize_t cuobj_srv_handle_get_async(
 }
 
 /**
- * Submit an async PUT using a raw rbuf handle (not a CuObjSrvBuffer).
- */
-ssize_t cuobj_srv_handle_put_async_rbuf(
-    void *handle, const char *key, void *rbuf,
-    uint64_t remote_start, size_t size, const char *descr,
-    uint16_t channel, void *async_handle)
-{
-    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
-    return h->server->handlePutObject(
-        std::string(key), static_cast<struct rdma_buffer *>(rbuf),
-        remote_start, size, std::string(descr), channel,
-        /*local_offset=*/0, /*status=*/nullptr, async_handle);
-}
-
-ssize_t cuobj_srv_handle_get_async_rbuf(
-    void *handle, const char *key, void *rbuf,
-    uint64_t remote_start, size_t size, const char *descr,
-    uint16_t channel, void *async_handle)
-{
-    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
-    return h->server->handleGetObject(
-        std::string(key), static_cast<struct rdma_buffer *>(rbuf),
-        remote_start, size, std::string(descr), channel,
-        /*local_offset=*/0, /*status=*/nullptr, async_handle);
-}
-
-/**
  * Poll for completions of async PUT/GET operations on the given channel.
  *
  * `events` must point to an array of at least `max_events` elements.

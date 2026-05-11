@@ -157,6 +157,82 @@ extern "C" {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// cuObjGet / ops.get callback support
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Rust-compatible mirror of `cufileRDMAInfo_t` from `cufile.h`.
+///
+/// Passed to the `ops.get` callback by cuObj; carries the RDMA descriptor
+/// string that must be forwarded to the server via the control channel.
+#[cfg(feature = "client")]
+#[repr(C)]
+pub struct CuFileRdmaInfo {
+    pub version:  i32,
+    pub desc_len: i32,
+    pub desc_str: *const c_char,
+}
+
+// SAFETY: desc_str points into cuobj-internal memory that is valid for the
+// duration of the ops.get callback invocation.
+#[cfg(feature = "client")]
+unsafe impl Send for CuFileRdmaInfo {}
+#[cfg(feature = "client")]
+unsafe impl Sync for CuFileRdmaInfo {}
+
+/// ops.get callback type: receives the RDMA descriptor from cuObjGet.
+///
+/// Parameters mirror `CUObjOps_t::get` from `cuobjclient.h`:
+/// - `handle`    — cuobj internal handle; pass to `cuobj_client_get_ctx_from_handle`
+/// - `ptr`       — destination buffer
+/// - `size`      — transfer size in bytes
+/// - `offset`    — object offset (loff_t = i64)
+/// - `rdma_info` — descriptor struct (version, desc_len, desc_str)
+///
+/// Must return `size` on success or `-1` on failure.
+#[cfg(feature = "client")]
+pub type OpsGetFn = unsafe extern "C" fn(
+    handle:    *const c_void,
+    ptr:       *mut c_char,
+    size:      usize,
+    offset:    i64,
+    rdma_info: *const CuFileRdmaInfo,
+) -> isize;
+
+#[cfg(feature = "client")]
+extern "C" {
+    /// Retrieve the user context (`ctx`) from a cuobj callback handle.
+    ///
+    /// Call this inside an `ops.get` callback: `handle` is the opaque argument
+    /// passed by cuObj, and the return value is the `ctx` pointer that was
+    /// supplied to [`cuobj_client_get`].
+    pub fn cuobj_client_get_ctx_from_handle(cuobj_handle: *const c_void) -> *mut c_void;
+
+    /// Create a `cuObjClient` with `ops.get` set to `get_cb`.
+    ///
+    /// cuObjGet will invoke `get_cb` with the RDMA descriptor; the callback
+    /// forwards it to the upstream server and waits for RDMA completion.
+    ///
+    /// Returns an opaque handle, or `NULL` on failure.
+    pub fn cuobj_client_create_with_get_cb(get_cb: OpsGetFn) -> *mut c_void;
+
+    /// Perform a GET via `cuObjClient::cuObjGet`.
+    ///
+    /// `ctx` is forwarded to the `ops.get` callback via
+    /// `cuobj_client_get_ctx_from_handle`.  The buffer at `ptr` must have been
+    /// registered with [`cuobj_client_mem_get_descriptor`] beforehand.
+    ///
+    /// Returns bytes transferred (≥ 0) on success, or -1 on failure.
+    pub fn cuobj_client_get(
+        handle:     *mut c_void,
+        ctx:        *mut c_void,
+        ptr:        *mut c_void,
+        size:       usize,
+        offset:     i64,
+        buf_offset: i64,
+    ) -> isize;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // cuObjServer FFI (server_wrapper.cpp → libcuobjserver.so)
 // ─────────────────────────────────────────────────────────────────────────────
 

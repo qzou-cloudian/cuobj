@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Formatting check ──────────────────────────────────────────────────────
+  # Runs on standard GitHub-hosted runners; no SDK required.
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # ── Build, lint, and unit-test ────────────────────────────────────────────
+  # Requires a self-hosted runner that has the cuObj SDK installed.
+  #
+  # Runner setup (one-time, on the RDMA host):
+  #   1. Install the cuObj SDK (sets up libcuobjclient.so + cuobjclient.h).
+  #   2. Register the runner:
+  #        gh act runner add --label rdma
+  #      or follow https://docs.github.com/en/actions/hosting-your-own-runners
+  #   3. Set CUOBJ_ROOT_DIR in the runner's environment if the SDK is not in
+  #      /usr/local/cuda-13.2/targets/x86_64-linux (the default search path).
+
+  build-and-test:
+    name: Build and Test
+    runs-on: [self-hosted, rdma]
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy --features client,server
+
+      - name: Unit tests
+        run: cargo test --features client,server
+
+      - name: Build examples
+        run: |
+          cargo build --example pingpong --features client,server
+          cargo build --example client   --features client
+          cargo build --example server   --features server
+
+  # ── Hardware integration tests ────────────────────────────────────────────
+  # Same self-hosted runner; also requires a live RDMA fabric.
+  # RDMA_IP is read from /etc/cufile.json on the runner host if not set here.
+
+  integration:
+    name: Integration Tests
+    runs-on: [self-hosted, rdma]
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run integration tests
+        run: |
+          cargo test --test rdma_integration --features client,server \
+            -- --include-ignored

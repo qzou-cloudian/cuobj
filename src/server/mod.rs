@@ -5,14 +5,15 @@
 //!
 //! This module sits on top of `cuobj-sys` and provides:
 //!
-//! * [`CuObjServer`] — the main entry point.  Thread-safe.  Wraps a
-//!   `cuObjServer` C++ object, which listens on an RDMA-capable NIC and
-//!   services RDMA_READ (PUT) and RDMA_WRITE (GET) requests from clients.
-//! * [`Channel`] — a RAII guard that returns a channel ID to the server's pool
-//!   on drop.  Each concurrent RDMA operation must use a distinct channel.
-//! * [`AllocatedBuffer`] — a RAII guard for a 4 KiB-aligned host buffer that
-//!   is registered with the RDMA fabric.  Deregisters and frees memory on
-//!   drop.
+//! * [`CuObjServer`] — thread-safe main entry point.  Wraps a `cuObjServer`
+//!   C++ object that listens on an RDMA-capable NIC and services RDMA_READ
+//!   (PUT) and RDMA_WRITE (GET) requests from clients.
+//! * [`Channel`] — RAII guard that returns a channel ID to the server's pool
+//!   on drop.  Each concurrent RDMA operation must hold a distinct channel.
+//! * [`AllocatedBuffer`] — RAII guard for a 4 KiB-aligned RDMA-registered
+//!   host buffer.  Deregisters and frees on drop.
+//! * [`PersistentBuffer`] — like [`AllocatedBuffer`] but constructed from
+//!   [`Arc<CuObjServer>`], suitable for long-lived buffer pools.
 //!
 //! # High-level vs. low-level APIs
 //!
@@ -40,7 +41,6 @@
 //! ```
 
 use std::ffi::{CString, c_void};
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 pub use cuobj_sys::CuObjAsyncEvent;
@@ -139,36 +139,29 @@ pub enum CuObjServerError {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CuObjServer
+// ServerHandle — shared ownership of the C++ cuObjServer
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Safe wrapper around the `cuObjServer` C++ object.
+/// Shared handle to the C++ `cuObjServer` object.
 ///
-/// This type is not [`Clone`] — cloning would duplicate ownership of the
-/// underlying C++ handle and lead to a double-free.
-///
-/// # Thread safety
-///
-/// `CuObjServer` is `Send + Sync`.  Concurrent operations must each hold
-/// a distinct [`Channel`] obtained via [`alloc_channel`][Self::alloc_channel].
-///
-/// # Lifecycle
-///
-/// ```text
-///   CuObjServer::new(ip, port)
-///         │
-///         ├── alloc_channel()           → Channel (auto-freed on drop)
-///         │
-///         ├── alloc_buffer(size)        → AllocatedBuffer (auto-freed on drop)
-///         │       │
-///         │       ├── handle_put / handle_get  ← low-level RDMA
-///         │       └── (drop)           → deregister + free
-///         │
-///         ├── receive_put(key, offset, size, token)  ← high-level: alloc + PUT + return Vec
-///         ├── send_get(key, offset, data, token)     ← high-level: alloc + copy + GET
-///         │
-///         └── Drop                     → cuobj_srv_destroy
-/// ```
+/// [`CuObjServer`], [`AllocatedBuffer`], [`Channel`], and [`PersistentBuffer`]
+/// all hold an `Arc` to this handle so the C++ object is not destroyed until
+/// all of them have been dropped.
+struct ServerHandle(*mut c_void);
+
+// SAFETY: cuObjServer uses channel IDs for internal thread isolation.
+unsafe impl Send for ServerHandle {}
+unsafe impl Sync for ServerHandle {}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        unsafe { cuobj_srv_destroy(self.0) };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal token helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Parse the client's buffer virtual address from the first colon-delimited
 /// hex field of an RDMA token.
@@ -297,11 +290,39 @@ fn do_handle_get(
     Ok(n as usize)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CuObjServer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Safe wrapper around the `cuObjServer` C++ object.
+///
+/// This type is not [`Clone`] — cloning would duplicate ownership of the
+/// underlying C++ handle and lead to a double-free.
+///
+/// # Thread safety
+///
+/// `CuObjServer` is `Send + Sync`.  Concurrent operations must each hold
+/// a distinct [`Channel`] obtained via [`alloc_channel`][Self::alloc_channel].
+///
+/// # Lifecycle
+///
+/// ```text
+///   CuObjServer::new(ip, port)
+///         │
+///         ├── alloc_channel()           → Channel (auto-freed on drop)
+///         │
+///         ├── alloc_buffer(size)        → AllocatedBuffer (auto-freed on drop)
+///         │       │
+///         │       ├── handle_put / handle_get  ← low-level RDMA
+///         │       └── (drop)           → deregister + free
+///         │
+///         ├── receive_put(key, offset, size, token)  ← high-level: alloc + PUT + return Vec
+///         ├── send_get(key, offset, data, token)     ← high-level: alloc + copy + GET
+///         │
+///         └── Drop                     → cuobj_srv_destroy (when last Arc released)
+/// ```
 pub struct CuObjServer {
-    /// Raw `CuObjSrvHandle*`.  `pub(crate)` so [`PersistentBuffer::new`] can
-    /// call `cuobj_srv_alloc_register` without a lifetime-bound borrow of
-    /// `CuObjServer`.
-    pub(crate) handle: *mut c_void,
+    srv: Arc<ServerHandle>,
 }
 
 // SAFETY: cuObjServer uses channel IDs for internal thread isolation.
@@ -314,7 +335,7 @@ impl CuObjServer {
     /// # Arguments
     ///
     /// * `ip`   — IP address of the RDMA NIC (e.g. `"192.168.100.1"`).
-    /// * `port` — TCP/RDMA port (e.g. `4421`).
+    /// * `port` — RDMA port (e.g. `4421`).
     ///
     /// # Errors
     ///
@@ -322,23 +343,23 @@ impl CuObjServer {
     /// `cuObjServer` constructor fails.
     pub fn new(ip: &str, port: u16) -> Result<Self, CuObjServerError> {
         let ip_cstr = CString::new(ip)?;
-        let handle = unsafe { cuobj_srv_create(ip_cstr.as_ptr(), port) };
-        if handle.is_null() {
+        let raw = unsafe { cuobj_srv_create(ip_cstr.as_ptr(), port) };
+        if raw.is_null() {
             return Err(CuObjServerError::CreateFailed {
                 ip: ip.to_owned(),
                 port,
             });
         }
-        Ok(Self { handle })
+        Ok(Self { srv: Arc::new(ServerHandle(raw)) })
     }
 
     /// Returns `true` if the server is connected to the RDMA fabric.
     pub fn is_connected(&self) -> bool {
-        unsafe { cuobj_srv_is_connected(self.handle) != 0 }
+        unsafe { cuobj_srv_is_connected(self.srv.0) != 0 }
     }
 
     /// Raw C++ server handle for direct FFI use.
-    pub fn handle(&self) -> *mut c_void { self.handle }
+    pub fn handle(&self) -> *mut c_void { self.srv.0 }
 
     // ── Telemetry (static / library-wide) ────────────────────────────────────
 
@@ -381,16 +402,12 @@ impl CuObjServer {
     ///
     /// Returns [`CuObjServerError::ChannelAllocFailed`] when no channels are
     /// available (`INVALID_CHANNEL_ID` returned by the C API).
-    pub fn alloc_channel(&self) -> Result<Channel<'_>, CuObjServerError> {
-        let id = unsafe { cuobj_srv_alloc_channel(self.handle) };
+    pub fn alloc_channel(&self) -> Result<Channel, CuObjServerError> {
+        let id = unsafe { cuobj_srv_alloc_channel(self.srv.0) };
         if id == u16::MAX {
             return Err(CuObjServerError::ChannelAllocFailed);
         }
-        Ok(Channel {
-            server_handle: self.handle,
-            id,
-            _server: PhantomData,
-        })
+        Ok(Channel { srv: Arc::clone(&self.srv), id })
     }
 
     /// Free a channel by its raw `u16` ID, bypassing the [`Channel`] RAII guard.
@@ -403,7 +420,7 @@ impl CuObjServer {
     /// Passing `u16::MAX` (`INVALID_CHANNEL_ID`) is a no-op.
     pub fn free_channel_by_id(&self, channel_id: u16) {
         if channel_id != u16::MAX {
-            unsafe { cuobj_srv_free_channel(self.handle, channel_id) };
+            unsafe { cuobj_srv_free_channel(self.srv.0, channel_id) };
         }
     }
 
@@ -422,7 +439,7 @@ impl CuObjServer {
     ) -> Result<usize, CuObjServerError> {
         let n = unsafe {
             cuobj_srv_poll(
-                self.handle,
+                self.srv.0,
                 events.as_mut_ptr(),
                 events.len() as std::os::raw::c_int,
                 channel_id,
@@ -443,15 +460,28 @@ impl CuObjServer {
     ///
     /// Returns an opaque `*mut c_void` handle for deregistration.
     /// Does NOT free the host memory on deregister — caller owns that.
-    pub fn register_existing_buffer(&self, ptr: *mut u8, size: usize) -> Option<*mut c_void> {
-        let rbuf = unsafe { cuobj_srv_register_buffer(self.handle, ptr as *mut c_void, size) };
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to a live allocation of at least `size` bytes that
+    /// remains valid until the returned handle is passed to
+    /// [`deregister_buffer`][Self::deregister_buffer].
+    pub unsafe fn register_existing_buffer(&self, ptr: *mut u8, size: usize) -> Option<*mut c_void> {
+        let rbuf = unsafe { cuobj_srv_register_buffer(self.srv.0, ptr as *mut c_void, size) };
         if rbuf.is_null() { None } else { Some(rbuf) }
     }
 
     /// Deregister a buffer registered via [`register_existing_buffer`](Self::register_existing_buffer).
     /// Does NOT free the host memory.
-    pub fn deregister_buffer(&self, rbuf: *mut c_void) {
-        unsafe { cuobj_srv_deregister_buffer(self.handle, rbuf) };
+    ///
+    /// # Safety
+    ///
+    /// `rbuf` must be a handle previously returned by
+    /// [`register_existing_buffer`][Self::register_existing_buffer] on the same
+    /// server instance and must not be used again after this call. The caller is
+    /// responsible for freeing the underlying host memory separately.
+    pub unsafe fn deregister_buffer(&self, rbuf: *mut c_void) {
+        unsafe { cuobj_srv_deregister_buffer(self.srv.0, rbuf) };
     }
 
     /// Allocate a 4 KiB-aligned host buffer of `size` bytes and register it
@@ -464,19 +494,18 @@ impl CuObjServer {
     ///
     /// Returns [`CuObjServerError::BufferAllocFailed`] if either the
     /// allocation or the RDMA registration fails.
-    pub fn alloc_buffer(&self, size: usize) -> Result<AllocatedBuffer<'_>, CuObjServerError> {
-        let buf = unsafe { cuobj_srv_alloc_register(self.handle, size) };
+    pub fn alloc_buffer(&self, size: usize) -> Result<AllocatedBuffer, CuObjServerError> {
+        let buf = unsafe { cuobj_srv_alloc_register(self.srv.0, size) };
         if buf.is_null() {
             return Err(CuObjServerError::BufferAllocFailed { size });
         }
         let data_ptr = unsafe { cuobj_srv_buf_data(buf) as *mut u8 };
         let buf_size = unsafe { cuobj_srv_buf_size(buf) };
         Ok(AllocatedBuffer {
-            server_handle: self.handle,
+            srv: Arc::clone(&self.srv),
             buf,
             data_ptr,
             size: buf_size,
-            _server: PhantomData,
         })
     }
 
@@ -507,14 +536,14 @@ impl CuObjServer {
     pub fn handle_put(
         &self,
         key: &str,
-        buf: &AllocatedBuffer<'_>,
-        offset: u64,
+        buf: &AllocatedBuffer,
+        offset: usize,
         size: usize,
         rdma_token: &str,
-        channel: &Channel<'_>,
+        channel: &Channel,
     ) -> Result<usize, CuObjServerError> {
-        let (remote_start, size) = token_resolve_clamp(rdma_token, offset as usize, size)?;
-        do_handle_put(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
+        let (remote_start, size) = token_resolve_clamp(rdma_token, offset, size)?;
+        do_handle_put(self.srv.0, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
     /// Perform an RDMA GET: RDMA_WRITE from `buf` into the client's buffer
@@ -535,14 +564,14 @@ impl CuObjServer {
     pub fn handle_get(
         &self,
         key: &str,
-        buf: &AllocatedBuffer<'_>,
-        offset: u64,
+        buf: &AllocatedBuffer,
+        offset: usize,
         size: usize,
         rdma_token: &str,
-        channel: &Channel<'_>,
+        channel: &Channel,
     ) -> Result<usize, CuObjServerError> {
-        let (remote_start, size) = token_resolve_clamp(rdma_token, offset as usize, size)?;
-        do_handle_get(self.handle, key, buf.buf, remote_start, size, rdma_token, channel.id)
+        let (remote_start, size) = token_resolve_clamp(rdma_token, offset, size)?;
+        do_handle_get(self.srv.0, key, buf.buf, remote_start, size, rdma_token, channel.id)
     }
 
     // ── High-level convenience ───────────────────────────────────────────────
@@ -570,18 +599,16 @@ impl CuObjServer {
     pub fn receive_put(
         &self,
         key: &str,
-        offset: u64,
+        offset: usize,
         size: usize,
         rdma_token: &str,
     ) -> Result<Vec<u8>, CuObjServerError> {
         let buf     = self.alloc_buffer(size)?;
         let channel = self.alloc_channel()?;
         let n       = self.handle_put(key, &buf, offset, size, rdma_token, &channel)?;
-        // Defend against the C++ layer returning more bytes than the buffer size.
+        // Clamp: guard against the C++ layer reporting more bytes than the buffer holds.
         let len     = n.min(buf.len());
-        let data = buf.as_slice()[..len].to_vec();
-        Ok(data)
-        // `channel` and `buf` drop here → free channel ID and deregister buffer.
+        Ok(buf[..len].to_vec())
     }
 
     /// Send a GET object via RDMA.
@@ -605,30 +632,21 @@ impl CuObjServer {
     pub fn send_get(
         &self,
         key: &str,
-        offset: u64,
+        offset: usize,
         data: &[u8],
         rdma_token: &str,
     ) -> Result<usize, CuObjServerError> {
         let mut buf = self.alloc_buffer(data.len())?;
-        // Fill the RDMA-registered buffer with the object data.
-        buf.as_mut_slice()[..data.len()].copy_from_slice(data);
+        buf[..data.len()].copy_from_slice(data);
         let channel = self.alloc_channel()?;
-        let n       = self.handle_get(key, &buf, offset, data.len(), rdma_token, &channel)?;
-        Ok(n)
-        // `channel` and `buf` drop here → free channel ID and deregister buffer.
-    }
-}
-
-impl Drop for CuObjServer {
-    fn drop(&mut self) {
-        unsafe { cuobj_srv_destroy(self.handle) };
+        self.handle_get(key, &buf, offset, data.len(), rdma_token, &channel)
     }
 }
 
 impl std::fmt::Debug for CuObjServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CuObjServer")
-            .field("handle", &self.handle)
+            .field("handle", &self.srv.0)
             .finish()
     }
 }
@@ -643,34 +661,51 @@ impl std::fmt::Debug for CuObjServer {
 /// to the server's pool when this guard is dropped.
 ///
 /// Each concurrent RDMA operation must use a distinct `Channel`.
-pub struct Channel<'a> {
-    server_handle: *mut c_void,
-    id:            u16,
-    _server:       PhantomData<&'a CuObjServer>,
+///
+/// `Channel` holds an `Arc` to the underlying server handle, so it has no
+/// lifetime parameter and can be stored in structs or held across `async`
+/// await points.
+pub struct Channel {
+    srv: Arc<ServerHandle>,
+    id:  u16,
 }
 
 // SAFETY: the server handle is thread-safe; channel IDs are per-operation.
-unsafe impl Send for Channel<'_> {}
-unsafe impl Sync for Channel<'_> {}
+unsafe impl Send for Channel {}
+unsafe impl Sync for Channel {}
 
-impl Channel<'_> {
-    /// The raw channel ID, for use with lower-level FFI if needed.
+impl Channel {
+    /// The raw channel ID.
     #[inline]
     pub fn id(&self) -> u16 {
         self.id
     }
+
+    /// Consume this guard and return the raw channel ID **without** returning
+    /// it to the pool.
+    ///
+    /// Use this when the channel must outlive the current scope — for example
+    /// when handing ownership to a worker thread.  The caller is then fully
+    /// responsible for eventually passing the ID to
+    /// [`CuObjServer::free_channel_by_id`].
+    #[inline]
+    pub fn into_id(self) -> u16 {
+        let id = self.id;
+        std::mem::forget(self);
+        id
+    }
 }
 
-impl Drop for Channel<'_> {
+impl Drop for Channel {
     fn drop(&mut self) {
         // u16::MAX == INVALID_CHANNEL_ID — freeing it is undefined behaviour.
         if self.id != u16::MAX {
-            unsafe { cuobj_srv_free_channel(self.server_handle, self.id) };
+            unsafe { cuobj_srv_free_channel(self.srv.0, self.id) };
         }
     }
 }
 
-impl std::fmt::Debug for Channel<'_> {
+impl std::fmt::Debug for Channel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Channel").field("id", &self.id).finish()
     }
@@ -684,20 +719,23 @@ impl std::fmt::Debug for Channel<'_> {
 ///
 /// Obtained via [`CuObjServer::alloc_buffer`].  The buffer is deregistered
 /// from the RDMA fabric and freed when this guard is dropped.
-pub struct AllocatedBuffer<'a> {
-    server_handle: *mut c_void,
-    buf:           *mut c_void,
-    data_ptr:      *mut u8,
-    size:          usize,
-    _server:       PhantomData<&'a CuObjServer>,
+///
+/// `AllocatedBuffer` holds an `Arc` to the underlying server handle, so it
+/// has no lifetime parameter and can be stored in structs or held across
+/// `async` await points.
+pub struct AllocatedBuffer {
+    srv:      Arc<ServerHandle>,
+    buf:      *mut c_void,
+    data_ptr: *mut u8,
+    size:     usize,
 }
 
 // SAFETY: the server handle is thread-safe; each AllocatedBuffer owns its
 // distinct allocation.
-unsafe impl Send for AllocatedBuffer<'_> {}
-unsafe impl Sync for AllocatedBuffer<'_> {}
+unsafe impl Send for AllocatedBuffer {}
+unsafe impl Sync for AllocatedBuffer {}
 
-impl AllocatedBuffer<'_> {
+impl AllocatedBuffer {
     /// Length of the buffer in bytes.
     #[inline]
     pub fn len(&self) -> usize {
@@ -746,13 +784,13 @@ impl AllocatedBuffer<'_> {
     }
 }
 
-impl Drop for AllocatedBuffer<'_> {
+impl Drop for AllocatedBuffer {
     fn drop(&mut self) {
-        unsafe { cuobj_srv_deregister_free(self.server_handle, self.buf) };
+        unsafe { cuobj_srv_deregister_free(self.srv.0, self.buf) };
     }
 }
 
-impl std::fmt::Debug for AllocatedBuffer<'_> {
+impl std::fmt::Debug for AllocatedBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AllocatedBuffer")
             .field("buf", &self.buf)
@@ -760,17 +798,29 @@ impl std::fmt::Debug for AllocatedBuffer<'_> {
     }
 }
 
+impl std::ops::Deref for AllocatedBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for AllocatedBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PersistentBuffer
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A 4 KiB-aligned RDMA-registered host buffer whose lifetime is tied to an
-/// [`Arc<CuObjServer>`] rather than a borrow of one.
+/// A 4 KiB-aligned RDMA-registered host buffer with no lifetime parameter.
 ///
-/// Unlike [`AllocatedBuffer`], which uses a borrowed `&CuObjServer` (and
-/// therefore cannot outlive the server reference), `PersistentBuffer` holds an
-/// `Arc<CuObjServer>` and can therefore be stored in long-lived structures
-/// such as buffer pools without lifetime parameters.
+/// Like [`AllocatedBuffer`], but constructed from an [`Arc<CuObjServer>`]
+/// instead of a borrow, making it suitable for long-lived structures such as
+/// buffer pools.  Internally it holds an `Arc` to the shared server handle so
+/// the C++ object remains alive for as long as any `PersistentBuffer` is live.
 ///
 /// The buffer is allocated and registered with the RDMA fabric once, on
 /// construction, and deregistered + freed only when `PersistentBuffer` is
@@ -787,7 +837,7 @@ impl std::fmt::Debug for AllocatedBuffer<'_> {
 /// buf.as_mut_slice().fill(0xAB_u8);
 /// ```
 pub struct PersistentBuffer {
-    server:   Arc<CuObjServer>,
+    srv:      Arc<ServerHandle>,
     buf:      *mut c_void,
     data_ptr: *mut u8,
     size:     usize,
@@ -802,13 +852,14 @@ impl PersistentBuffer {
     /// Allocate a 4 KiB-aligned host buffer of `size` bytes and register it
     /// with the RDMA fabric.
     pub fn new(server: Arc<CuObjServer>, size: usize) -> Result<Self, CuObjServerError> {
-        let buf = unsafe { cuobj_srv_alloc_register(server.handle, size) };
+        let srv = Arc::clone(&server.srv);
+        let buf = unsafe { cuobj_srv_alloc_register(srv.0, size) };
         if buf.is_null() {
             return Err(CuObjServerError::BufferAllocFailed { size });
         }
         let data_ptr = unsafe { cuobj_srv_buf_data(buf) as *mut u8 };
         let buf_size = unsafe { cuobj_srv_buf_size(buf) };
-        Ok(Self { server, buf, data_ptr, size: buf_size })
+        Ok(Self { srv, buf, data_ptr, size: buf_size })
     }
 
     /// Length of the buffer in bytes.
@@ -871,14 +922,14 @@ impl PersistentBuffer {
     ) -> Result<usize, CuObjServerError> {
         let (remote_start, size) = token_resolve_clamp(token, offset, size)?;
         match channel_id {
-            Some(ch_id) => do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id),
+            Some(ch_id) => do_handle_put(self.srv.0, key, self.buf, remote_start, size, token, ch_id),
             None => {
-                let ch_id = unsafe { cuobj_srv_alloc_channel(self.server.handle) };
+                let ch_id = unsafe { cuobj_srv_alloc_channel(self.srv.0) };
                 if ch_id == u16::MAX {
                     return Err(CuObjServerError::ChannelAllocFailed);
                 }
-                let _scoped = ScopedChannel { server_handle: self.server.handle, id: ch_id };
-                do_handle_put(self.server.handle, key, self.buf, remote_start, size, token, ch_id)
+                let _scoped = ScopedChannel { server_handle: self.srv.0, id: ch_id };
+                do_handle_put(self.srv.0, key, self.buf, remote_start, size, token, ch_id)
             }
         }
     }
@@ -900,14 +951,14 @@ impl PersistentBuffer {
     ) -> Result<usize, CuObjServerError> {
         let (remote_start, size) = token_resolve_clamp(token, offset, size)?;
         match channel_id {
-            Some(ch_id) => do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id),
+            Some(ch_id) => do_handle_get(self.srv.0, key, self.buf, remote_start, size, token, ch_id),
             None => {
-                let ch_id = unsafe { cuobj_srv_alloc_channel(self.server.handle) };
+                let ch_id = unsafe { cuobj_srv_alloc_channel(self.srv.0) };
                 if ch_id == u16::MAX {
                     return Err(CuObjServerError::ChannelAllocFailed);
                 }
-                let _scoped = ScopedChannel { server_handle: self.server.handle, id: ch_id };
-                do_handle_get(self.server.handle, key, self.buf, remote_start, size, token, ch_id)
+                let _scoped = ScopedChannel { server_handle: self.srv.0, id: ch_id };
+                do_handle_get(self.srv.0, key, self.buf, remote_start, size, token, ch_id)
             }
         }
     }
@@ -931,7 +982,7 @@ impl PersistentBuffer {
     ///
     /// `async_handle` must remain valid until the corresponding completion is
     /// harvested via [`CuObjServer::poll_channel`].
-    pub fn submit_put_async(
+    pub unsafe fn submit_put_async(
         &self,
         key:          &str,
         offset:       usize,
@@ -945,7 +996,7 @@ impl PersistentBuffer {
         let tok_cs = CString::new(token)?;
         let rc = unsafe {
             cuobj_srv_handle_put_async(
-                self.server.handle,
+                self.srv.0,
                 key_cs.as_ptr(),
                 self.buf,
                 remote_start as u64,
@@ -974,7 +1025,7 @@ impl PersistentBuffer {
     ///
     /// `async_handle` must remain valid until the corresponding completion is
     /// harvested via [`CuObjServer::poll_channel`].
-    pub fn submit_get_async(
+    pub unsafe fn submit_get_async(
         &self,
         key:          &str,
         offset:       usize,
@@ -988,7 +1039,7 @@ impl PersistentBuffer {
         let tok_cs = CString::new(token)?;
         let rc = unsafe {
             cuobj_srv_handle_get_async(
-                self.server.handle,
+                self.srv.0,
                 key_cs.as_ptr(),
                 self.buf,
                 remote_start as u64,
@@ -1010,7 +1061,7 @@ impl PersistentBuffer {
 
 impl Drop for PersistentBuffer {
     fn drop(&mut self) {
-        unsafe { cuobj_srv_deregister_free(self.server.handle, self.buf) };
+        unsafe { cuobj_srv_deregister_free(self.srv.0, self.buf) };
     }
 }
 
@@ -1019,6 +1070,19 @@ impl std::fmt::Debug for PersistentBuffer {
         f.debug_struct("PersistentBuffer")
             .field("buf", &self.buf)
             .finish()
+    }
+}
+
+impl std::ops::Deref for PersistentBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for PersistentBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
     }
 }
 
@@ -1129,10 +1193,9 @@ mod tests {
 
     #[test]
     fn token_resolve_clamp_offset_exceeds_size() {
+        // client size = 0x100, offset = 0x80 → available = 0x80; request 0x100 is clamped.
         let token = "1000:100:rkey";
         let (_, clamped) = token_resolve_clamp(token, 0x80, 0x100).unwrap();
-        // offset 0x80 > client size 0x100? No, 0x80 < 0x100. Wait:
-        // client size = 0x100 = 256. offset = 0x80 = 128. max = 0x100 - 0x80 = 0x80.
         assert_eq!(clamped, 0x80);
     }
 }

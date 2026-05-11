@@ -3,14 +3,24 @@
 
 //! Build script: compiles the cuObj C++ shims and links the native libraries.
 //!
-//! # Required environment variables
+//! # Environment variables
 //!
 //! | Variable         | Description                                              |
 //! |------------------|----------------------------------------------------------|
-//! | `CUOBJ_ROOT_DIR` | Root of the cuObj / CUDA SDK installation.               |
-//! |                  | Defaults to `/usr/local/cuda` if unset.                  |
-//! | `CUOBJ_LIB_DIR`  | Override for the directory containing                    |
-//! |                  | `libcuobjclient.so`. Checked before `CUOBJ_ROOT_DIR`.    |
+//! | `CUOBJ_ROOT_DIR` | Override the cuObj / CUDA SDK root.  When set, it is     |
+//! |                  | tried first before the built-in fallback paths.          |
+//! | `CUOBJ_LIB_DIR`  | Override the directory containing `libcuobjclient.so`.   |
+//! |                  | Bypasses the normal library search entirely.             |
+//!
+//! # SDK search order
+//!
+//! When `CUOBJ_ROOT_DIR` is not set the build script looks for
+//! `cuobjclient.h` (and `libcuobjclient.so`) in these paths, in order:
+//!
+//! 1. `$CUOBJ_ROOT_DIR/include` (if the variable is set)
+//! 2. `/usr/local/cuda-13.2/targets/x86_64-linux`
+//! 3. `/usr/local/cuda/targets/x86_64-linux`
+//! 4. `/usr/local/cuda`
 
 fn fail(msg: &str) -> ! {
     eprintln!("error: {msg}");

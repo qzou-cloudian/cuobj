@@ -117,7 +117,7 @@ fn run_client(server_ip: &str) {
     ping_buf[..4].copy_from_slice(b"ping");
 
     let reg_ping = client
-        .register_raii(ping_buf.as_mut_ptr(), ping_buf.len())
+        .register_buffer(ping_buf.as_mut_ptr(), ping_buf.len())
         .expect("[client] register ping buffer failed");
 
     let put_token = reg_ping
@@ -130,7 +130,7 @@ fn run_client(server_ip: &str) {
     let mut pong_buf = vec![0u8; 4096];
 
     let reg_pong = client
-        .register_raii(pong_buf.as_mut_ptr(), pong_buf.len())
+        .register_buffer(pong_buf.as_mut_ptr(), pong_buf.len())
         .expect("[client] register pong buffer failed");
 
     let get_token = reg_pong
