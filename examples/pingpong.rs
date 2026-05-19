@@ -25,9 +25,9 @@
 
 #[cfg(feature = "server")]
 fn run_server() {
+    use cuobj::CuObjServer;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
-    use cuobj::CuObjServer;
 
     let rdma_ip = std::env::var("RDMA_IP").unwrap_or_else(|_| "10.50.132.250".into());
     let rdma_port: u16 = std::env::var("RDMA_PORT")
@@ -39,9 +39,13 @@ fn run_server() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(7070);
 
-    let server = CuObjServer::new(&rdma_ip, rdma_port)
-        .unwrap_or_else(|e| panic!("[server] cuObjServer init failed ({rdma_ip}:{rdma_port}): {e}"));
-    println!("[server] RDMA ready at {rdma_ip}:{rdma_port}  connected={}", server.is_connected());
+    let server = CuObjServer::new(&rdma_ip, rdma_port).unwrap_or_else(|e| {
+        panic!("[server] cuObjServer init failed ({rdma_ip}:{rdma_port}): {e}")
+    });
+    println!(
+        "[server] RDMA ready at {rdma_ip}:{rdma_port}  connected={}",
+        server.is_connected()
+    );
 
     // Wait for the client to connect on the TCP control plane.
     let listener = TcpListener::bind(format!("0.0.0.0:{ctrl_port}"))
@@ -84,7 +88,10 @@ fn run_server() {
     reader.read_line(&mut line).expect("read pong token");
     let pong_token = line.trim().to_owned();
     let pong_payload: &[u8] = b"pong";
-    println!("[server] sending {:?} via RDMA GET …", std::str::from_utf8(pong_payload).unwrap());
+    println!(
+        "[server] sending {:?} via RDMA GET …",
+        std::str::from_utf8(pong_payload).unwrap()
+    );
     server
         .send_get("pingpong/pong", 0, pong_payload, &pong_token)
         .expect("[server] send_get failed");
@@ -98,9 +105,9 @@ fn run_server() {
 
 #[cfg(feature = "client")]
 fn run_client(server_ip: &str) {
+    use cuobj::CuObjClient;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    use cuobj::CuObjClient;
 
     let ctrl_port: u16 = std::env::var("CTRL_PORT")
         .ok()
@@ -161,7 +168,11 @@ fn run_client(server_ip: &str) {
 
     let mut line = String::new();
     reader.read_line(&mut line).expect("read done");
-    assert_eq!(line.trim(), "done", "[client] unexpected control message: {line:?}");
+    assert_eq!(
+        line.trim(),
+        "done",
+        "[client] unexpected control message: {line:?}"
+    );
 
     // ── verify the pong ───────────────────────────────────────────────────────
 
@@ -169,7 +180,10 @@ fn run_client(server_ip: &str) {
     let received = &reg_pong.as_slice()[..4];
     let pong_str = std::str::from_utf8(received).unwrap_or("????");
     println!("[client] received: {pong_str:?}");
-    assert_eq!(received, b"pong", "[client] expected \"pong\", got {pong_str:?}");
+    assert_eq!(
+        received, b"pong",
+        "[client] expected \"pong\", got {pong_str:?}"
+    );
     println!("[client] pingpong complete ✓");
 
     // reg_pong and reg_ping drop here → buffers automatically deregistered.

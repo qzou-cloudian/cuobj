@@ -37,18 +37,17 @@
 //! ```
 
 use std::collections::HashSet;
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{c_char, c_void, CStr};
 use std::sync::{Arc, Mutex};
 
 use cuobj_sys::{
-    CU_OBJ_SUCCESS, CUOBJ_GET, CUOBJ_MEMORY_CUDA_DEVICE, CUOBJ_MEMORY_CUDA_MANAGED,
-    CUOBJ_MEMORY_INVALID, CUOBJ_MEMORY_SYSTEM, CUOBJ_MEMORY_UNKNOWN, CUOBJ_PUT,
     cuobj_client_create, cuobj_client_destroy, cuobj_client_get_memory_type,
     cuobj_client_is_connected, cuobj_client_mem_get_descriptor,
     cuobj_client_mem_get_max_request_callback_size, cuobj_client_mem_get_rdma_token,
-    cuobj_client_mem_put_descriptor, cuobj_client_mem_put_rdma_token,
-    cuobj_client_set_telem_flags, cuobj_client_setup_telemetry,
-    cuobj_client_shutdown_telemetry,
+    cuobj_client_mem_put_descriptor, cuobj_client_mem_put_rdma_token, cuobj_client_set_telem_flags,
+    cuobj_client_setup_telemetry, cuobj_client_shutdown_telemetry, CUOBJ_GET,
+    CUOBJ_MEMORY_CUDA_DEVICE, CUOBJ_MEMORY_CUDA_MANAGED, CUOBJ_MEMORY_INVALID, CUOBJ_MEMORY_SYSTEM,
+    CUOBJ_MEMORY_UNKNOWN, CUOBJ_PUT, CU_OBJ_SUCCESS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,9 +66,7 @@ pub enum CuObjClientError {
     CreateFailed,
 
     /// Memory registration failed.
-    #[error(
-        "memory registration failed for ptr={ptr:#x} size={size}: {reason}"
-    )]
+    #[error("memory registration failed for ptr={ptr:#x} size={size}: {reason}")]
     RegistrationFailed {
         ptr: usize,
         size: usize,
@@ -127,12 +124,12 @@ impl MemoryType {
 
     fn from_raw(v: i32) -> Self {
         match v {
-            x if x == CUOBJ_MEMORY_SYSTEM       => MemoryType::System,
+            x if x == CUOBJ_MEMORY_SYSTEM => MemoryType::System,
             x if x == CUOBJ_MEMORY_CUDA_MANAGED => MemoryType::CudaManaged,
-            x if x == CUOBJ_MEMORY_CUDA_DEVICE  => MemoryType::CudaDevice,
-            x if x == CUOBJ_MEMORY_UNKNOWN      => MemoryType::Unknown,
-            x if x == CUOBJ_MEMORY_INVALID      => MemoryType::Invalid,
-            _                                   => MemoryType::Unknown,
+            x if x == CUOBJ_MEMORY_CUDA_DEVICE => MemoryType::CudaDevice,
+            x if x == CUOBJ_MEMORY_UNKNOWN => MemoryType::Unknown,
+            x if x == CUOBJ_MEMORY_INVALID => MemoryType::Invalid,
+            _ => MemoryType::Unknown,
         }
     }
 }
@@ -209,7 +206,7 @@ pub struct CuObjRdmaToken {
     /// SDK-allocated descriptor string; freed (and invalidated) on drop.
     desc_str: *mut c_char,
     /// Keeps the C++ client alive until this token is dropped.
-    _handle:  Arc<ClientHandle>,
+    _handle: Arc<ClientHandle>,
 }
 
 // SAFETY: the descriptor string is a plain C string with no thread affinity.
@@ -275,7 +272,9 @@ impl Drop for CuObjRdmaToken {
 
 impl std::fmt::Debug for CuObjRdmaToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("CuObjRdmaToken").field(&self.as_str()).finish()
+        f.debug_tuple("CuObjRdmaToken")
+            .field(&self.as_str())
+            .finish()
     }
 }
 
@@ -330,10 +329,10 @@ pub fn is_rdma_suitable(ptr: *const u8) -> bool {
 
 fn make_rdma_token(
     handle: &Arc<ClientHandle>,
-    ptr:    *const u8,
-    size:   usize,
+    ptr: *const u8,
+    size: usize,
     offset: usize,
-    op:     OpType,
+    op: OpType,
 ) -> Result<CuObjRdmaToken, CuObjClientError> {
     let mut desc_str: *mut c_char = std::ptr::null_mut();
     let rc = unsafe {
@@ -353,7 +352,10 @@ fn make_rdma_token(
             reason: format!("cuMemObjGetRDMAToken returned {rc}"),
         });
     }
-    Ok(CuObjRdmaToken { desc_str, _handle: Arc::clone(handle) })
+    Ok(CuObjRdmaToken {
+        desc_str,
+        _handle: Arc::clone(handle),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,7 +389,7 @@ fn make_rdma_token(
 /// The C++ object is not destroyed until all [`CuObjRdmaToken`]s and
 /// [`RegisteredBuffer`]s created by this client have also been dropped.
 pub struct CuObjClient {
-    handle:     Arc<ClientHandle>,
+    handle: Arc<ClientHandle>,
     /// Shared with every [`RegisteredBuffer`] produced by this client so that
     /// buffers can remove themselves from the set on drop without borrowing
     /// `&CuObjClient`.
@@ -411,7 +413,7 @@ impl CuObjClient {
             return Err(CuObjClientError::CreateFailed);
         }
         Ok(Self {
-            handle:     Arc::new(ClientHandle(raw)),
+            handle: Arc::new(ClientHandle(raw)),
             registered: Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -462,11 +464,13 @@ impl CuObjClient {
             // the entry will prevent a retry that might confuse the library.
             reg.insert(addr);
         }
-        let rc = unsafe {
-            cuobj_client_mem_get_descriptor(self.handle.0, ptr as *mut c_void, size)
-        };
+        let rc =
+            unsafe { cuobj_client_mem_get_descriptor(self.handle.0, ptr as *mut c_void, size) };
         if rc != CU_OBJ_SUCCESS {
-            self.registered.lock().expect("CuObjClient mutex poisoned").remove(&addr);
+            self.registered
+                .lock()
+                .expect("CuObjClient mutex poisoned")
+                .remove(&addr);
             return Err(CuObjClientError::RegistrationFailed {
                 ptr: addr,
                 size,
@@ -481,13 +485,15 @@ impl CuObjClient {
     /// If `ptr` was not registered, this is a no-op and returns `Ok(())`.
     pub fn deregister(&self, ptr: *mut u8) -> Result<(), CuObjClientError> {
         let addr = ptr as usize;
-        let was_registered = self.registered.lock().expect("CuObjClient mutex poisoned").remove(&addr);
+        let was_registered = self
+            .registered
+            .lock()
+            .expect("CuObjClient mutex poisoned")
+            .remove(&addr);
         if !was_registered {
             return Ok(());
         }
-        let rc = unsafe {
-            cuobj_client_mem_put_descriptor(self.handle.0, ptr as *mut c_void)
-        };
+        let rc = unsafe { cuobj_client_mem_put_descriptor(self.handle.0, ptr as *mut c_void) };
         if rc != CU_OBJ_SUCCESS {
             return Err(CuObjClientError::DeregistrationFailed {
                 ptr: addr,
@@ -535,12 +541,13 @@ impl CuObjClient {
     /// Returns `None` if the query fails (e.g., `ptr` is not registered).
     pub fn max_transfer_size(&self, ptr: *const u8) -> Option<usize> {
         let v = unsafe {
-            cuobj_client_mem_get_max_request_callback_size(
-                self.handle.0,
-                ptr as *mut c_void,
-            )
+            cuobj_client_mem_get_max_request_callback_size(self.handle.0, ptr as *mut c_void)
         };
-        if v < 0 { None } else { Some(v as usize) }
+        if v < 0 {
+            None
+        } else {
+            Some(v as usize)
+        }
     }
 
     // ── RAII convenience ─────────────────────────────────────────────────────
@@ -563,7 +570,7 @@ impl CuObjClient {
     ) -> Result<RegisteredBuffer, CuObjClientError> {
         self.register(ptr, size)?;
         Ok(RegisteredBuffer {
-            handle:     Arc::clone(&self.handle),
+            handle: Arc::clone(&self.handle),
             registered: Arc::clone(&self.registered),
             ptr,
             size,
@@ -635,7 +642,11 @@ impl std::fmt::Debug for CuObjClient {
             .field("handle", &self.handle.0)
             .field(
                 "registrations",
-                &self.registered.lock().map(|g| g.len()).unwrap_or(usize::MAX),
+                &self
+                    .registered
+                    .lock()
+                    .map(|g| g.len())
+                    .unwrap_or(usize::MAX),
             )
             .finish()
     }
@@ -655,10 +666,10 @@ impl std::fmt::Debug for CuObjClient {
 /// can be freely stored in structs, returned from functions, or held across
 /// `async` await points.
 pub struct RegisteredBuffer {
-    handle:     Arc<ClientHandle>,
+    handle: Arc<ClientHandle>,
     registered: Arc<Mutex<HashSet<usize>>>,
-    ptr:        *mut u8,
-    size:       usize,
+    ptr: *mut u8,
+    size: usize,
 }
 
 // SAFETY: RegisteredBuffer holds a raw pointer to caller-owned memory.
@@ -706,11 +717,7 @@ impl RegisteredBuffer {
     ///
     /// Returns [`CuObjClientError::TokenFailed`] if `offset + len` exceeds
     /// [`Self::size`].
-    pub fn put_token(
-        &self,
-        offset: usize,
-        len: usize,
-    ) -> Result<CuObjRdmaToken, CuObjClientError> {
+    pub fn put_token(&self, offset: usize, len: usize) -> Result<CuObjRdmaToken, CuObjClientError> {
         if offset.saturating_add(len) > self.size {
             return Err(CuObjClientError::TokenFailed {
                 op: OpType::Put,
@@ -726,11 +733,7 @@ impl RegisteredBuffer {
 
     /// Generate a GET RDMA descriptor covering `len` bytes at `offset` within
     /// the registered buffer.
-    pub fn get_token(
-        &self,
-        offset: usize,
-        len: usize,
-    ) -> Result<CuObjRdmaToken, CuObjClientError> {
+    pub fn get_token(&self, offset: usize, len: usize) -> Result<CuObjRdmaToken, CuObjClientError> {
         if offset.saturating_add(len) > self.size {
             return Err(CuObjClientError::TokenFailed {
                 op: OpType::Get,
@@ -749,12 +752,13 @@ impl RegisteredBuffer {
     /// Returns `None` if the query fails.
     pub fn max_transfer_size(&self) -> Option<usize> {
         let v = unsafe {
-            cuobj_client_mem_get_max_request_callback_size(
-                self.handle.0,
-                self.ptr as *mut c_void,
-            )
+            cuobj_client_mem_get_max_request_callback_size(self.handle.0, self.ptr as *mut c_void)
         };
-        if v < 0 { None } else { Some(v as usize) }
+        if v < 0 {
+            None
+        } else {
+            Some(v as usize)
+        }
     }
 }
 
@@ -795,11 +799,26 @@ mod tests {
 
     #[test]
     fn memory_type_from_raw_known() {
-        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_SYSTEM), MemoryType::System);
-        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_CUDA_MANAGED), MemoryType::CudaManaged);
-        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_CUDA_DEVICE), MemoryType::CudaDevice);
-        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_UNKNOWN), MemoryType::Unknown);
-        assert_eq!(MemoryType::from_raw(CUOBJ_MEMORY_INVALID), MemoryType::Invalid);
+        assert_eq!(
+            MemoryType::from_raw(CUOBJ_MEMORY_SYSTEM),
+            MemoryType::System
+        );
+        assert_eq!(
+            MemoryType::from_raw(CUOBJ_MEMORY_CUDA_MANAGED),
+            MemoryType::CudaManaged
+        );
+        assert_eq!(
+            MemoryType::from_raw(CUOBJ_MEMORY_CUDA_DEVICE),
+            MemoryType::CudaDevice
+        );
+        assert_eq!(
+            MemoryType::from_raw(CUOBJ_MEMORY_UNKNOWN),
+            MemoryType::Unknown
+        );
+        assert_eq!(
+            MemoryType::from_raw(CUOBJ_MEMORY_INVALID),
+            MemoryType::Invalid
+        );
     }
 
     #[test]

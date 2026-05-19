@@ -20,12 +20,12 @@ pub mod server;
 
 #[cfg(feature = "client")]
 pub use client::{
-    is_rdma_suitable, memory_type,
-    CuObjClient, CuObjClientError, CuObjRdmaToken, MemoryType, OpType, RegisteredBuffer,
+    is_rdma_suitable, memory_type, CuObjClient, CuObjClientError, CuObjRdmaToken, MemoryType,
+    OpType, RegisteredBuffer,
 };
 
 #[cfg(feature = "server")]
 pub use server::{
-    AllocatedBuffer, Channel, CuObjAsyncEvent, CuObjServer, CuObjServerError,
-    PersistentBuffer, WcStatus,
+    AllocatedBuffer, Channel, CuObjAsyncEvent, CuObjServer, CuObjServerError, PersistentBuffer,
+    WcStatus,
 };

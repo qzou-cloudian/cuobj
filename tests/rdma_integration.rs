@@ -42,7 +42,11 @@ fn rdma_ip_from_cufile() -> Option<String> {
     let after_key = content.split("rdma_dev_addr_list").nth(1)?;
     let after_bracket = after_key.split('[').nth(1)?;
     let ip = after_bracket.split('"').nth(1)?;
-    if ip.is_empty() { None } else { Some(ip.to_owned()) }
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip.to_owned())
+    }
 }
 
 // ── client tests ──────────────────────────────────────────────────────────────
@@ -55,14 +59,20 @@ mod client {
     #[ignore = "requires RDMA hardware"]
     fn connect() {
         let client = CuObjClient::new().expect("CuObjClient::new");
-        assert!(client.is_connected(), "cuObjClient not connected to RDMA fabric");
+        assert!(
+            client.is_connected(),
+            "cuObjClient not connected to RDMA fabric"
+        );
     }
 
     #[test]
     #[ignore = "requires RDMA hardware"]
     fn memory_type_stack() {
         let probe: u8 = 0;
-        assert_eq!(CuObjClient::memory_type(&probe as *const u8), MemoryType::System);
+        assert_eq!(
+            CuObjClient::memory_type(&probe as *const u8),
+            MemoryType::System
+        );
         assert!(CuObjClient::is_rdma_suitable(&probe as *const u8));
     }
 
@@ -89,7 +99,10 @@ mod client {
             .expect("register_buffer");
         let tok = reg.put_token(0, reg.size()).expect("put_token");
         assert!(!tok.is_empty(), "PUT token must not be empty");
-        assert!(tok.as_str().contains(':'), "token should be colon-delimited");
+        assert!(
+            tok.as_str().contains(':'),
+            "token should be colon-delimited"
+        );
     }
 
     #[test]
@@ -126,7 +139,10 @@ mod client {
             .register_buffer(buf.as_mut_ptr(), buf.len())
             .expect("register_buffer");
         let mts = reg.max_transfer_size();
-        assert!(mts.is_some(), "max_transfer_size should be available for a registered buffer");
+        assert!(
+            mts.is_some(),
+            "max_transfer_size should be available for a registered buffer"
+        );
         assert!(mts.unwrap() > 0);
     }
 
@@ -152,15 +168,18 @@ mod client {
 
 #[cfg(feature = "server")]
 mod server {
-    use std::sync::Arc;
     use super::rdma_ip;
     use cuobj::{CuObjServer, PersistentBuffer};
+    use std::sync::Arc;
 
     #[test]
     #[ignore = "requires RDMA hardware"]
     fn connect() {
         let srv = CuObjServer::new(&rdma_ip(), 4440).expect("CuObjServer::new");
-        assert!(srv.is_connected(), "cuObjServer not connected to RDMA fabric");
+        assert!(
+            srv.is_connected(),
+            "cuObjServer not connected to RDMA fabric"
+        );
     }
 
     #[test]
@@ -218,13 +237,13 @@ mod server {
     #[test]
     #[ignore = "requires RDMA hardware"]
     fn register_existing_buffer() {
-        use std::alloc::{Layout, alloc, dealloc};
+        use std::alloc::{alloc, dealloc, Layout};
         let srv = CuObjServer::new(&rdma_ip(), 4446).expect("CuObjServer::new");
         let layout = Layout::from_size_align(4096, 4096).unwrap();
         let ptr = unsafe { alloc(layout) };
         assert!(!ptr.is_null());
-        let rbuf = unsafe { srv.register_existing_buffer(ptr, 4096) }
-            .expect("register_existing_buffer");
+        let rbuf =
+            unsafe { srv.register_existing_buffer(ptr, 4096) }.expect("register_existing_buffer");
         unsafe { srv.deregister_buffer(rbuf) };
         unsafe { dealloc(ptr, layout) };
     }

@@ -82,12 +82,18 @@ fn main() {
             .warnings(false)
             .compile("cuobjclientwrapper");
 
-        println!("cargo:rustc-link-search=native={}", client_lib_dir.display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            client_lib_dir.display()
+        );
         println!("cargo:rustc-link-lib=dylib=cuobjclient");
         // Embed the SDK library path in the binary so LD_LIBRARY_PATH isn't
         // needed at runtime (libcuobjclient.so is not in the default ld.so
         // search path on most systems).
-        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}", client_lib_dir.display());
+        println!(
+            "cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}",
+            client_lib_dir.display()
+        );
         println!("cargo:rerun-if-changed=src/wrapper.cpp");
     }
 
@@ -97,11 +103,7 @@ fn main() {
         // Library search path for libcuobjserver.
         // Priority: system multiarch → system → local (last — /usr/local/lib
         // may contain builds that are incompatible with the running glibc).
-        let server_lib_dirs: &[&str] = &[
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib",
-            "/usr/local/lib",
-        ];
+        let server_lib_dirs: &[&str] = &["/usr/lib/x86_64-linux-gnu", "/usr/lib", "/usr/local/lib"];
         let server_lib_dir = server_lib_dirs
             .iter()
             .map(|p| std::path::PathBuf::from(p))
@@ -120,9 +122,15 @@ fn main() {
             .warnings(false)
             .compile("cuobjserverwrapper");
 
-        println!("cargo:rustc-link-search=native={}", server_lib_dir.display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            server_lib_dir.display()
+        );
         println!("cargo:rustc-link-lib=dylib=cuobjserver");
-        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}", server_lib_dir.display());
+        println!(
+            "cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}",
+            server_lib_dir.display()
+        );
         println!("cargo:rerun-if-changed=src/server_wrapper.cpp");
     }
 

@@ -167,7 +167,7 @@ extern "C" {
 #[cfg(feature = "client")]
 #[repr(C)]
 pub struct CuFileRdmaInfo {
-    pub version:  i32,
+    pub version: i32,
     pub desc_len: i32,
     pub desc_str: *const c_char,
 }
@@ -191,10 +191,10 @@ unsafe impl Sync for CuFileRdmaInfo {}
 /// Must return `size` on success or `-1` on failure.
 #[cfg(feature = "client")]
 pub type OpsGetFn = unsafe extern "C" fn(
-    handle:    *const c_void,
-    ptr:       *mut c_char,
-    size:      usize,
-    offset:    i64,
+    handle: *const c_void,
+    ptr: *mut c_char,
+    size: usize,
+    offset: i64,
     rdma_info: *const CuFileRdmaInfo,
 ) -> isize;
 
@@ -223,11 +223,11 @@ extern "C" {
     ///
     /// Returns bytes transferred (≥ 0) on success, or -1 on failure.
     pub fn cuobj_client_get(
-        handle:     *mut c_void,
-        ctx:        *mut c_void,
-        ptr:        *mut c_void,
-        size:       usize,
-        offset:     i64,
+        handle: *mut c_void,
+        ctx: *mut c_void,
+        ptr: *mut c_void,
+        size: usize,
+        offset: i64,
         buf_offset: i64,
     ) -> isize;
 }
@@ -248,28 +248,28 @@ pub type ibv_wc_status = i32;
 #[cfg(feature = "server")]
 pub mod wc_status {
     use super::ibv_wc_status;
-    pub const SUCCESS: ibv_wc_status            = 0;
-    pub const LOC_LEN_ERR: ibv_wc_status        = 1;
-    pub const LOC_QP_OP_ERR: ibv_wc_status      = 2;
-    pub const LOC_EEC_OP_ERR: ibv_wc_status     = 3;
-    pub const LOC_PROT_ERR: ibv_wc_status       = 4;
-    pub const WR_FLUSH_ERR: ibv_wc_status       = 5;
-    pub const MW_BIND_ERR: ibv_wc_status        = 6;
-    pub const BAD_RESP_ERR: ibv_wc_status       = 7;
-    pub const LOC_ACCESS_ERR: ibv_wc_status     = 8;
-    pub const REM_INV_REQ_ERR: ibv_wc_status    = 9;
-    pub const REM_ACCESS_ERR: ibv_wc_status     = 10;
-    pub const REM_OP_ERR: ibv_wc_status         = 11;
-    pub const RETRY_EXC_ERR: ibv_wc_status      = 12;
-    pub const RNR_RETRY_EXC_ERR: ibv_wc_status  = 13;
-    pub const LOC_RDD_VIOL_ERR: ibv_wc_status   = 14;
+    pub const SUCCESS: ibv_wc_status = 0;
+    pub const LOC_LEN_ERR: ibv_wc_status = 1;
+    pub const LOC_QP_OP_ERR: ibv_wc_status = 2;
+    pub const LOC_EEC_OP_ERR: ibv_wc_status = 3;
+    pub const LOC_PROT_ERR: ibv_wc_status = 4;
+    pub const WR_FLUSH_ERR: ibv_wc_status = 5;
+    pub const MW_BIND_ERR: ibv_wc_status = 6;
+    pub const BAD_RESP_ERR: ibv_wc_status = 7;
+    pub const LOC_ACCESS_ERR: ibv_wc_status = 8;
+    pub const REM_INV_REQ_ERR: ibv_wc_status = 9;
+    pub const REM_ACCESS_ERR: ibv_wc_status = 10;
+    pub const REM_OP_ERR: ibv_wc_status = 11;
+    pub const RETRY_EXC_ERR: ibv_wc_status = 12;
+    pub const RNR_RETRY_EXC_ERR: ibv_wc_status = 13;
+    pub const LOC_RDD_VIOL_ERR: ibv_wc_status = 14;
     pub const REM_INV_RD_REQ_ERR: ibv_wc_status = 15;
-    pub const REM_ABORT_ERR: ibv_wc_status      = 16;
-    pub const INV_EECN_ERR: ibv_wc_status       = 17;
-    pub const INV_EEC_STATE_ERR: ibv_wc_status  = 18;
-    pub const FATAL_ERR: ibv_wc_status          = 19;
-    pub const RESP_TIMEOUT_ERR: ibv_wc_status   = 20;
-    pub const GENERAL_ERR: ibv_wc_status        = 21;
+    pub const REM_ABORT_ERR: ibv_wc_status = 16;
+    pub const INV_EECN_ERR: ibv_wc_status = 17;
+    pub const INV_EEC_STATE_ERR: ibv_wc_status = 18;
+    pub const FATAL_ERR: ibv_wc_status = 19;
+    pub const RESP_TIMEOUT_ERR: ibv_wc_status = 20;
+    pub const GENERAL_ERR: ibv_wc_status = 21;
 }
 
 /// Completion event returned by [`cuobj_srv_poll`].
@@ -327,7 +327,11 @@ extern "C" {
 
     /// Register an existing host buffer for RDMA.
     /// Returns an opaque rdma_buffer* handle, or null on failure.
-    pub fn cuobj_srv_register_buffer(handle: *mut c_void, ptr: *mut c_void, size: usize) -> *mut c_void;
+    pub fn cuobj_srv_register_buffer(
+        handle: *mut c_void,
+        ptr: *mut c_void,
+        size: usize,
+    ) -> *mut c_void;
 
     /// Deregister a buffer registered via [`cuobj_srv_register_buffer`].
     /// Does NOT free the host memory.
@@ -386,38 +390,38 @@ extern "C" {
     /// `async_handle`).  Returns 0 on successful submission or -1 on failure.
     /// Call [`cuobj_srv_poll`] on the same channel to harvest completions.
     pub fn cuobj_srv_handle_put_async(
-        handle:          *mut c_void,
-        key:             *const c_char,
-        buf:             *mut c_void,
+        handle: *mut c_void,
+        key: *const c_char,
+        buf: *mut c_void,
         remote_buf_start: u64,
-        size:            usize,
-        rdma_descr:      *const c_char,
-        channel:         u16,
-        async_handle:    *mut c_void,
+        size: usize,
+        rdma_descr: *const c_char,
+        channel: u16,
+        async_handle: *mut c_void,
     ) -> isize;
 
     /// Submit an async S3 GET (`cuObjServer::handleGetObject` with non-NULL
     /// `async_handle`).  Returns 0 on successful submission or -1 on failure.
     /// Call [`cuobj_srv_poll`] on the same channel to harvest completions.
     pub fn cuobj_srv_handle_get_async(
-        handle:          *mut c_void,
-        key:             *const c_char,
-        buf:             *mut c_void,
+        handle: *mut c_void,
+        key: *const c_char,
+        buf: *mut c_void,
         remote_buf_start: u64,
-        size:            usize,
-        rdma_descr:      *const c_char,
-        channel:         u16,
-        async_handle:    *mut c_void,
+        size: usize,
+        rdma_descr: *const c_char,
+        channel: u16,
+        async_handle: *mut c_void,
     ) -> isize;
 
     /// Poll for completions on `channel`.  Fills up to `max_events` entries in
     /// `events`.  Returns the number of events filled (≥ 0) or a negative
     /// error code.
     pub fn cuobj_srv_poll(
-        handle:     *mut c_void,
-        events:     *mut CuObjAsyncEvent,
+        handle: *mut c_void,
+        events: *mut CuObjAsyncEvent,
         max_events: std::os::raw::c_int,
-        channel:    u16,
+        channel: u16,
     ) -> std::os::raw::c_int;
 
     /// Set up telemetry for all cuObjServer instances.

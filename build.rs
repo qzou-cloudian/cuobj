@@ -39,22 +39,25 @@ fn main() {
             })
             .unwrap_or_else(|| "/usr/local/cuda-13.2/targets/x86_64-linux/lib".into());
 
-        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}", client_lib_dir);
+        println!(
+            "cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}",
+            client_lib_dir
+        );
     }
 
     // ── Server library RPATH ────────────────────────────────────────────────
 
     if has_server {
-        let server_lib_dir = [
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib",
-        ]
-        .iter()
-        .find(|p| std::path::Path::new(p).join("libcuobjserver.so").exists())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "/usr/lib/x86_64-linux-gnu".into());
+        let server_lib_dir = ["/usr/lib/x86_64-linux-gnu", "/usr/lib"]
+            .iter()
+            .find(|p| std::path::Path::new(p).join("libcuobjserver.so").exists())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "/usr/lib/x86_64-linux-gnu".into());
 
-        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}", server_lib_dir);
+        println!(
+            "cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}",
+            server_lib_dir
+        );
     }
 
     // ── Re-run triggers ─────────────────────────────────────────────────────
