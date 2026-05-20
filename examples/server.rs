@@ -9,15 +9,39 @@
 //! If the binary was built without an RPATH, the library search path may be
 //! needed for `libcuobjclient.so` (the server links both libraries):
 //!   LD_LIBRARY_PATH=/usr/local/cuda-13.2/targets/x86_64-linux/lib \
-//!     RDMA_IP=10.50.132.250 RDMA_PORT=4421 \
+//!     RDMA_IP=<nic-ip> RDMA_PORT=4421 \
 //!     cargo run --example server --features server
+
+#[cfg(feature = "server")]
+fn rdma_ip() -> String {
+    if let Ok(ip) = std::env::var("RDMA_IP") {
+        return ip;
+    }
+    if let Some(ip) = rdma_ip_from_cufile() {
+        return ip;
+    }
+    panic!("set RDMA_IP or populate /etc/cufile.json properties.rdma_dev_addr_list");
+}
+
+#[cfg(feature = "server")]
+fn rdma_ip_from_cufile() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/cufile.json").ok()?;
+    let after_key = content.split("rdma_dev_addr_list").nth(1)?;
+    let after_bracket = after_key.split('[').nth(1)?;
+    let ip = after_bracket.split('"').nth(1)?;
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip.to_owned())
+    }
+}
 
 #[cfg(feature = "server")]
 fn main() {
     use cuobj::CuObjServer;
 
-    // Bind to an RDMA-capable NIC. Adjust IP and port for your environment.
-    let ip = std::env::var("RDMA_IP").unwrap_or_else(|_| "10.50.132.250".into());
+    // Bind to an RDMA-capable NIC. RDMA_IP overrides /etc/cufile.json.
+    let ip = rdma_ip();
     let port = std::env::var("RDMA_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

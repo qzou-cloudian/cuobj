@@ -17,11 +17,35 @@
 //!
 //! # Environment variables
 //!
-//!   RDMA_IP    RDMA NIC address for the server  (default: 10.50.132.250)
+//!   RDMA_IP    RDMA NIC address for the server  (default: /etc/cufile.json)
 //!   RDMA_PORT  RDMA port for the server          (default: 4421)
 //!   CTRL_PORT  TCP control-plane port            (default: 7070)
 
 // ── server ───────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "server")]
+fn rdma_ip() -> String {
+    if let Ok(ip) = std::env::var("RDMA_IP") {
+        return ip;
+    }
+    if let Some(ip) = rdma_ip_from_cufile() {
+        return ip;
+    }
+    panic!("set RDMA_IP or populate /etc/cufile.json properties.rdma_dev_addr_list");
+}
+
+#[cfg(feature = "server")]
+fn rdma_ip_from_cufile() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/cufile.json").ok()?;
+    let after_key = content.split("rdma_dev_addr_list").nth(1)?;
+    let after_bracket = after_key.split('[').nth(1)?;
+    let ip = after_bracket.split('"').nth(1)?;
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip.to_owned())
+    }
+}
 
 #[cfg(feature = "server")]
 fn run_server() {
@@ -29,7 +53,7 @@ fn run_server() {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
-    let rdma_ip = std::env::var("RDMA_IP").unwrap_or_else(|_| "10.50.132.250".into());
+    let rdma_ip = rdma_ip();
     let rdma_port: u16 = std::env::var("RDMA_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -216,7 +240,7 @@ fn main() {
   pingpong client [server-ip]   (default: 127.0.0.1)
 
 Environment variables:
-  RDMA_IP    RDMA NIC address (default: 10.50.132.250)
+  RDMA_IP    RDMA NIC address (default: /etc/cufile.json)
   RDMA_PORT  RDMA port        (default: 4421)
   CTRL_PORT  TCP ctrl port    (default: 7070)"
             );

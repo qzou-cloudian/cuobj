@@ -159,8 +159,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Run the example:
 
 ```sh
-RDMA_IP=10.50.132.250 RDMA_PORT=4421 cargo run --example server --features server
+RDMA_PORT=4421 cargo run --example server --features server
 ```
+
+If `RDMA_IP` is not set, the example uses the first address in
+`/etc/cufile.json` under `properties.rdma_dev_addr_list`.
 
 ### End-to-end ping-pong
 
@@ -171,11 +174,14 @@ The `pingpong` example demonstrates a full bidirectional RDMA round-trip between
 cargo build --example pingpong --features client,server
 
 # Terminal 1 — server
-RDMA_IP=<nic-ip> RDMA_PORT=4421 ./target/debug/examples/pingpong server
+RDMA_PORT=4421 ./target/debug/examples/pingpong server
 
 # Terminal 2 — client
 ./target/debug/examples/pingpong client <server-ip>
 ```
+
+If `RDMA_IP` is not set for the server, `pingpong` uses the first address in
+`/etc/cufile.json` under `properties.rdma_dev_addr_list`.
 
 The client registers two buffers (ping for PUT, pong for GET), sends their RDMA tokens over a TCP control connection, and verifies the pong buffer contains the expected data after the server completes both transfers.
 
