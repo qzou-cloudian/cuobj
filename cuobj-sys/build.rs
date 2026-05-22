@@ -101,12 +101,23 @@ fn main() {
 
     if has_server {
         // Library search path for libcuobjserver.
-        // Priority: system multiarch → system → local (last — /usr/local/lib
-        // may contain builds that are incompatible with the running glibc).
-        let server_lib_dirs: &[&str] = &["/usr/lib/x86_64-linux-gnu", "/usr/lib", "/usr/local/lib"];
-        let server_lib_dir = server_lib_dirs
+        // Priority: system multiarch -> system -> CUDA SDK -> local.
+        // Keep /usr/local/lib last: it may contain manually installed builds
+        // that do not match the selected headers.
+        let mut server_lib_candidates = vec![
+            std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+            std::path::PathBuf::from("/usr/lib"),
+        ];
+        server_lib_candidates.extend(
+            cuda_candidates
+                .iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| std::path::PathBuf::from(p).join("lib")),
+        );
+        server_lib_candidates.push(std::path::PathBuf::from("/usr/local/lib"));
+
+        let server_lib_dir = server_lib_candidates
             .iter()
-            .map(|p| std::path::PathBuf::from(p))
             .find(|p| p.join("libcuobjserver.so").exists())
             .unwrap_or_else(|| {
                 fail("Cannot find libcuobjserver.so.");

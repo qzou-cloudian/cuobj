@@ -27,5 +27,5 @@ pub use client::{
 #[cfg(feature = "server")]
 pub use server::{
     AllocatedBuffer, Channel, CuObjAsyncEvent, CuObjServer, CuObjServerError, PersistentBuffer,
-    WcStatus,
+    ScatterGatherBuffer, ScatterGatherEntry, WcStatus, MAX_SCATTER_GATHER_ENTRIES,
 };

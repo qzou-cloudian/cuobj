@@ -41,17 +41,24 @@
 //! ```
 
 use std::ffi::{c_void, CString};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 pub use cuobj_sys::CuObjAsyncEvent;
 use cuobj_sys::{
-    cuobj_srv_alloc_channel, cuobj_srv_alloc_register, cuobj_srv_buf_data, cuobj_srv_buf_size,
-    cuobj_srv_create, cuobj_srv_deregister_buffer, cuobj_srv_deregister_free, cuobj_srv_destroy,
-    cuobj_srv_free_channel, cuobj_srv_handle_get, cuobj_srv_handle_get_async, cuobj_srv_handle_put,
-    cuobj_srv_handle_put_async, cuobj_srv_is_connected, cuobj_srv_poll, cuobj_srv_register_buffer,
+    cuobj_srv_alloc_channel, cuobj_srv_alloc_register, cuobj_srv_buf_data, cuobj_srv_buf_rbuf,
+    cuobj_srv_buf_size, cuobj_srv_create, cuobj_srv_deregister_buffer, cuobj_srv_deregister_free,
+    cuobj_srv_destroy, cuobj_srv_free_channel, cuobj_srv_get_rdma_buffer_from_sg_list,
+    cuobj_srv_handle_get, cuobj_srv_handle_get_async, cuobj_srv_handle_get_rbuf,
+    cuobj_srv_handle_get_rbuf_async, cuobj_srv_handle_put, cuobj_srv_handle_put_async,
+    cuobj_srv_handle_put_rbuf, cuobj_srv_handle_put_rbuf_async, cuobj_srv_is_connected,
+    cuobj_srv_poll, cuobj_srv_put_rdma_buffer_from_sg_list, cuobj_srv_register_buffer,
     cuobj_srv_set_telem_flags, cuobj_srv_setup_telemetry, cuobj_srv_shutdown_telemetry,
-    ibv_wc_status, wc_status,
+    ibv_wc_status, wc_status, CuObjScatterGatherEntryWithOffset, CUOBJ_MAX_SGE,
 };
+
+/// Maximum number of scatter/gather entries supported by cuObj server APIs.
+pub const MAX_SCATTER_GATHER_ENTRIES: usize = CUOBJ_MAX_SGE;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WC status display helper
@@ -107,6 +114,18 @@ pub enum CuObjServerError {
     /// Buffer allocation / RDMA registration failed.
     #[error("failed to allocate/register RDMA buffer of size {size}")]
     BufferAllocFailed { size: usize },
+
+    /// Scatter/gather entry validation failed.
+    #[error("invalid scatter-gather list: {0}")]
+    InvalidScatterGatherList(String),
+
+    /// Scatter/gather RDMA buffer creation failed.
+    #[error("failed to create scatter-gather RDMA buffer")]
+    ScatterGatherBufferCreateFailed,
+
+    /// A buffer from one server instance was used with a different server.
+    #[error("buffer belongs to a different cuObjServer instance")]
+    BufferServerMismatch,
 
     /// Polling the completion queue failed.
     #[error("poll channel (id={channel_id}) failed: cuobj_srv_poll returned {raw_return}")]
@@ -222,6 +241,114 @@ fn token_resolve_clamp(
     Ok((remote_start, size.min(max_size)))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Scatter/gather helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A byte range inside an already registered server-side RDMA buffer.
+///
+/// Entries are consumed in order by [`ScatterGatherBuffer`] transfers.
+/// The cuObj SDK supports at most [`MAX_SCATTER_GATHER_ENTRIES`] entries per
+/// scatter/gather operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScatterGatherEntry {
+    /// Offset in bytes from the start of the registered base buffer.
+    pub offset: usize,
+    /// Number of bytes in this entry.
+    pub size: usize,
+}
+
+fn validate_sg_entries(
+    entries: &[ScatterGatherEntry],
+    base_len: usize,
+) -> Result<(Vec<CuObjScatterGatherEntryWithOffset>, usize), CuObjServerError> {
+    if entries.is_empty() {
+        return Err(CuObjServerError::InvalidScatterGatherList(
+            "at least one entry is required".to_owned(),
+        ));
+    }
+    if entries.len() > MAX_SCATTER_GATHER_ENTRIES {
+        return Err(CuObjServerError::InvalidScatterGatherList(format!(
+            "{} entries provided, maximum is {}",
+            entries.len(),
+            MAX_SCATTER_GATHER_ENTRIES
+        )));
+    }
+
+    let mut total_size = 0usize;
+    let mut ffi_entries = Vec::with_capacity(entries.len());
+
+    for (idx, entry) in entries.iter().enumerate() {
+        if entry.size == 0 {
+            return Err(CuObjServerError::InvalidScatterGatherList(format!(
+                "entry {idx} has zero size"
+            )));
+        }
+        if entry.offset > i64::MAX as usize {
+            return Err(CuObjServerError::InvalidScatterGatherList(format!(
+                "entry {idx} offset {} exceeds loff_t range",
+                entry.offset
+            )));
+        }
+
+        let end = entry.offset.checked_add(entry.size).ok_or_else(|| {
+            CuObjServerError::InvalidScatterGatherList(format!(
+                "entry {idx} offset + size overflows"
+            ))
+        })?;
+        if end > base_len {
+            return Err(CuObjServerError::InvalidScatterGatherList(format!(
+                "entry {idx} range [{}, {}) exceeds base buffer length {base_len}",
+                entry.offset, end
+            )));
+        }
+
+        total_size = total_size.checked_add(entry.size).ok_or_else(|| {
+            CuObjServerError::InvalidScatterGatherList(
+                "total scatter-gather size overflows".to_owned(),
+            )
+        })?;
+        ffi_entries.push(CuObjScatterGatherEntryWithOffset {
+            offset: entry.offset as i64,
+            size: entry.size,
+        });
+    }
+
+    Ok((ffi_entries, total_size))
+}
+
+fn create_scatter_gather_buffer<'a>(
+    srv: &Arc<ServerHandle>,
+    base_buf_handle: *mut c_void,
+    base_len: usize,
+    entries: &[ScatterGatherEntry],
+) -> Result<ScatterGatherBuffer<'a>, CuObjServerError> {
+    let (ffi_entries, total_size) = validate_sg_entries(entries, base_len)?;
+    let base_rbuf = unsafe { cuobj_srv_buf_rbuf(base_buf_handle) };
+    if base_rbuf.is_null() {
+        return Err(CuObjServerError::ScatterGatherBufferCreateFailed);
+    }
+
+    let rbuf = unsafe {
+        cuobj_srv_get_rdma_buffer_from_sg_list(
+            srv.0,
+            base_rbuf,
+            ffi_entries.as_ptr(),
+            ffi_entries.len(),
+        )
+    };
+    if rbuf.is_null() {
+        return Err(CuObjServerError::ScatterGatherBufferCreateFailed);
+    }
+
+    Ok(ScatterGatherBuffer {
+        srv: Arc::clone(srv),
+        rbuf,
+        size: total_size,
+        _base: PhantomData,
+    })
+}
+
 /// Internal helper: call `cuobj_srv_handle_put` given raw handles.
 fn do_handle_put(
     server_handle: *mut c_void,
@@ -240,6 +367,41 @@ fn do_handle_put(
             server_handle,
             key_cs.as_ptr(),
             buf,
+            remote_start as u64,
+            size,
+            tok_cs.as_ptr(),
+            channel_id,
+            &mut wc_status,
+        )
+    };
+    if n < 0 {
+        return Err(CuObjServerError::PutFailed {
+            key: key.to_owned(),
+            transferred: n,
+            wc_status: WcStatus(wc_status),
+        });
+    }
+    Ok(n as usize)
+}
+
+/// Internal helper: call `cuobj_srv_handle_put_rbuf` given a raw rdma_buffer*.
+fn do_handle_put_rbuf(
+    server_handle: *mut c_void,
+    key: &str,
+    rbuf: *mut c_void,
+    remote_start: usize,
+    size: usize,
+    rdma_token: &str,
+    channel_id: u16,
+) -> Result<usize, CuObjServerError> {
+    let key_cs = CString::new(key)?;
+    let tok_cs = CString::new(rdma_token)?;
+    let mut wc_status: ibv_wc_status = 0;
+    let n = unsafe {
+        cuobj_srv_handle_put_rbuf(
+            server_handle,
+            key_cs.as_ptr(),
+            rbuf,
             remote_start as u64,
             size,
             tok_cs.as_ptr(),
@@ -290,6 +452,41 @@ fn do_handle_get(
             server_handle,
             key_cs.as_ptr(),
             buf,
+            remote_start as u64,
+            size,
+            tok_cs.as_ptr(),
+            channel_id,
+            &mut wc_status,
+        )
+    };
+    if n < 0 {
+        return Err(CuObjServerError::GetFailed {
+            key: key.to_owned(),
+            transferred: n,
+            wc_status: WcStatus(wc_status),
+        });
+    }
+    Ok(n as usize)
+}
+
+/// Internal helper: call `cuobj_srv_handle_get_rbuf` given a raw rdma_buffer*.
+fn do_handle_get_rbuf(
+    server_handle: *mut c_void,
+    key: &str,
+    rbuf: *mut c_void,
+    remote_start: usize,
+    size: usize,
+    rdma_token: &str,
+    channel_id: u16,
+) -> Result<usize, CuObjServerError> {
+    let key_cs = CString::new(key)?;
+    let tok_cs = CString::new(rdma_token)?;
+    let mut wc_status: ibv_wc_status = 0;
+    let n = unsafe {
+        cuobj_srv_handle_get_rbuf(
+            server_handle,
+            key_cs.as_ptr(),
+            rbuf,
             remote_start as u64,
             size,
             tok_cs.as_ptr(),
@@ -539,6 +736,24 @@ impl CuObjServer {
             data_ptr,
             size: buf_size,
         })
+    }
+
+    /// Create a scatter/gather RDMA buffer view over ranges in `base`.
+    ///
+    /// The returned [`ScatterGatherBuffer`] borrows `base`; dropping it calls
+    /// `putRDMABufferFromSgList` and leaves the base buffer registered.
+    ///
+    /// `entries` are interpreted in order as offsets and sizes within `base`.
+    /// The cuObj SDK supports at most [`MAX_SCATTER_GATHER_ENTRIES`] entries.
+    pub fn scatter_gather_buffer<'a>(
+        &self,
+        base: &'a AllocatedBuffer,
+        entries: &[ScatterGatherEntry],
+    ) -> Result<ScatterGatherBuffer<'a>, CuObjServerError> {
+        if !Arc::ptr_eq(&self.srv, &base.srv) {
+            return Err(CuObjServerError::BufferServerMismatch);
+        }
+        create_scatter_gather_buffer(&self.srv, base.buf, base.len(), entries)
     }
 
     // ── Low-level RDMA operations ────────────────────────────────────────────
@@ -860,6 +1075,209 @@ impl std::ops::DerefMut for AllocatedBuffer {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ScatterGatherBuffer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// RAII guard for a scatter/gather RDMA buffer derived from a base buffer.
+///
+/// Construct with [`CuObjServer::scatter_gather_buffer`] or
+/// [`PersistentBuffer::scatter_gather`].  The base buffer remains registered
+/// and owned by its original guard; dropping `ScatterGatherBuffer` releases
+/// only the derived SG RDMA buffer by calling `putRDMABufferFromSgList`.
+///
+/// The entry order defines the local transfer order.  For example, entries
+/// `{ offset: 128, size: 4 }` and `{ offset: 512, size: 4 }` transfer 8 bytes
+/// total, mapping the first 4 bytes to `base[128..132]` and the next 4 bytes
+/// to `base[512..516]`.
+pub struct ScatterGatherBuffer<'a> {
+    srv: Arc<ServerHandle>,
+    rbuf: *mut c_void,
+    size: usize,
+    _base: PhantomData<&'a [u8]>,
+}
+
+// SAFETY: the server handle is internally thread-safe; the derived buffer is
+// tied to the lifetime of its base registration.
+unsafe impl<'a> Send for ScatterGatherBuffer<'a> {}
+unsafe impl<'a> Sync for ScatterGatherBuffer<'a> {}
+
+impl<'a> ScatterGatherBuffer<'a> {
+    /// Total transfer size in bytes across all scatter/gather entries.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Returns `true` if the total transfer size is zero.
+    ///
+    /// Safe constructors reject zero-sized entries and empty lists, so this is
+    /// expected to return `false` for values created by this crate.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Raw pointer to the derived `rdma_buffer*` handle.
+    pub fn raw_rbuf_handle(&self) -> *mut c_void {
+        self.rbuf
+    }
+
+    /// Perform an RDMA_READ from the remote client buffer into this
+    /// scatter/gather view.
+    ///
+    /// `remote_offset` is the byte offset within the client's registered
+    /// buffer.  When `channel_id` is `None`, a fresh channel is allocated and
+    /// freed around the call.
+    pub fn handle_put(
+        &self,
+        key: &str,
+        remote_offset: usize,
+        token: &str,
+        channel_id: Option<u16>,
+    ) -> Result<usize, CuObjServerError> {
+        let (remote_start, size) = token_resolve_clamp(token, remote_offset, self.size)?;
+        match channel_id {
+            Some(ch_id) => {
+                do_handle_put_rbuf(self.srv.0, key, self.rbuf, remote_start, size, token, ch_id)
+            }
+            None => {
+                let ch_id = unsafe { cuobj_srv_alloc_channel(self.srv.0) };
+                if ch_id == u16::MAX {
+                    return Err(CuObjServerError::ChannelAllocFailed);
+                }
+                let _scoped = ScopedChannel {
+                    server_handle: self.srv.0,
+                    id: ch_id,
+                };
+                do_handle_put_rbuf(self.srv.0, key, self.rbuf, remote_start, size, token, ch_id)
+            }
+        }
+    }
+
+    /// Perform an RDMA_WRITE from this scatter/gather view into the remote
+    /// client buffer.
+    ///
+    /// `remote_offset` is the byte offset within the client's registered
+    /// buffer.  Populate the base buffer ranges before calling this method.
+    pub fn handle_get(
+        &self,
+        key: &str,
+        remote_offset: usize,
+        token: &str,
+        channel_id: Option<u16>,
+    ) -> Result<usize, CuObjServerError> {
+        let (remote_start, size) = token_resolve_clamp(token, remote_offset, self.size)?;
+        match channel_id {
+            Some(ch_id) => {
+                do_handle_get_rbuf(self.srv.0, key, self.rbuf, remote_start, size, token, ch_id)
+            }
+            None => {
+                let ch_id = unsafe { cuobj_srv_alloc_channel(self.srv.0) };
+                if ch_id == u16::MAX {
+                    return Err(CuObjServerError::ChannelAllocFailed);
+                }
+                let _scoped = ScopedChannel {
+                    server_handle: self.srv.0,
+                    id: ch_id,
+                };
+                do_handle_get_rbuf(self.srv.0, key, self.rbuf, remote_start, size, token, ch_id)
+            }
+        }
+    }
+
+    /// Submit an async RDMA PUT into this scatter/gather view.
+    ///
+    /// # Safety
+    ///
+    /// `async_handle` must remain valid until the corresponding completion is
+    /// harvested via [`CuObjServer::poll_channel`].
+    pub unsafe fn submit_put_async(
+        &self,
+        key: &str,
+        remote_offset: usize,
+        token: &str,
+        channel_id: u16,
+        async_handle: *mut c_void,
+    ) -> Result<(), CuObjServerError> {
+        let (remote_start, size) = token_resolve_clamp(token, remote_offset, self.size)?;
+        let key_cs = CString::new(key)?;
+        let tok_cs = CString::new(token)?;
+        let rc = unsafe {
+            cuobj_srv_handle_put_rbuf_async(
+                self.srv.0,
+                key_cs.as_ptr(),
+                self.rbuf,
+                remote_start as u64,
+                size,
+                tok_cs.as_ptr(),
+                channel_id,
+                async_handle,
+            )
+        };
+        if rc < 0 {
+            return Err(CuObjServerError::SubmitFailed {
+                key: key.to_owned(),
+                raw_return: rc,
+            });
+        }
+        Ok(())
+    }
+
+    /// Submit an async RDMA GET from this scatter/gather view.
+    ///
+    /// # Safety
+    ///
+    /// `async_handle` must remain valid until the corresponding completion is
+    /// harvested via [`CuObjServer::poll_channel`].
+    pub unsafe fn submit_get_async(
+        &self,
+        key: &str,
+        remote_offset: usize,
+        token: &str,
+        channel_id: u16,
+        async_handle: *mut c_void,
+    ) -> Result<(), CuObjServerError> {
+        let (remote_start, size) = token_resolve_clamp(token, remote_offset, self.size)?;
+        let key_cs = CString::new(key)?;
+        let tok_cs = CString::new(token)?;
+        let rc = unsafe {
+            cuobj_srv_handle_get_rbuf_async(
+                self.srv.0,
+                key_cs.as_ptr(),
+                self.rbuf,
+                remote_start as u64,
+                size,
+                tok_cs.as_ptr(),
+                channel_id,
+                async_handle,
+            )
+        };
+        if rc < 0 {
+            return Err(CuObjServerError::SubmitFailed {
+                key: key.to_owned(),
+                raw_return: rc,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ScatterGatherBuffer<'_> {
+    fn drop(&mut self) {
+        unsafe { cuobj_srv_put_rdma_buffer_from_sg_list(self.srv.0, self.rbuf) };
+    }
+}
+
+impl std::fmt::Debug for ScatterGatherBuffer<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScatterGatherBuffer")
+            .field("rbuf", &self.rbuf)
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PersistentBuffer
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -956,6 +1374,17 @@ impl PersistentBuffer {
     /// buffer exist for the duration of the returned reference.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.size) }
+    }
+
+    /// Create a scatter/gather RDMA buffer view over ranges in this buffer.
+    ///
+    /// The returned [`ScatterGatherBuffer`] borrows this base buffer and
+    /// releases only the derived SG RDMA buffer on drop.
+    pub fn scatter_gather<'a>(
+        &'a self,
+        entries: &[ScatterGatherEntry],
+    ) -> Result<ScatterGatherBuffer<'a>, CuObjServerError> {
+        create_scatter_gather_buffer(&self.srv, self.buf, self.len(), entries)
     }
 
     /// Perform an RDMA_READ from the remote client buffer into this buffer.
@@ -1266,5 +1695,61 @@ mod tests {
         let token = "1000:100:rkey";
         let (_, clamped) = token_resolve_clamp(token, 0x80, 0x100).unwrap();
         assert_eq!(clamped, 0x80);
+    }
+
+    // ── scatter/gather validation ─────────────────────────────────────────────
+
+    #[test]
+    fn validate_sg_entries_valid() {
+        let entries = [
+            ScatterGatherEntry { offset: 4, size: 8 },
+            ScatterGatherEntry {
+                offset: 32,
+                size: 16,
+            },
+        ];
+        let (ffi_entries, total_size) = validate_sg_entries(&entries, 64).unwrap();
+
+        assert_eq!(total_size, 24);
+        assert_eq!(ffi_entries.len(), 2);
+        assert_eq!(ffi_entries[0].offset, 4);
+        assert_eq!(ffi_entries[0].size, 8);
+        assert_eq!(ffi_entries[1].offset, 32);
+        assert_eq!(ffi_entries[1].size, 16);
+    }
+
+    #[test]
+    fn validate_sg_entries_rejects_empty_list() {
+        assert!(validate_sg_entries(&[], 64).is_err());
+    }
+
+    #[test]
+    fn validate_sg_entries_rejects_too_many_entries() {
+        let entries = [ScatterGatherEntry { offset: 0, size: 1 }; MAX_SCATTER_GATHER_ENTRIES + 1];
+        assert!(validate_sg_entries(&entries, 64).is_err());
+    }
+
+    #[test]
+    fn validate_sg_entries_rejects_zero_size_entry() {
+        let entries = [ScatterGatherEntry { offset: 0, size: 0 }];
+        assert!(validate_sg_entries(&entries, 64).is_err());
+    }
+
+    #[test]
+    fn validate_sg_entries_rejects_out_of_bounds_entry() {
+        let entries = [ScatterGatherEntry {
+            offset: 60,
+            size: 8,
+        }];
+        assert!(validate_sg_entries(&entries, 64).is_err());
+    }
+
+    #[test]
+    fn validate_sg_entries_rejects_range_overflow() {
+        let entries = [ScatterGatherEntry {
+            offset: usize::MAX,
+            size: 1,
+        }];
+        assert!(validate_sg_entries(&entries, usize::MAX).is_err());
     }
 }

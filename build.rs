@@ -48,11 +48,18 @@ fn main() {
     // ── Server library RPATH ────────────────────────────────────────────────
 
     if has_server {
-        let server_lib_dir = ["/usr/lib/x86_64-linux-gnu", "/usr/lib"]
-            .iter()
-            .find(|p| std::path::Path::new(p).join("libcuobjserver.so").exists())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "/usr/lib/x86_64-linux-gnu".into());
+        let server_lib_dir = [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib",
+            "/usr/local/cuda-13.2/targets/x86_64-linux/lib",
+            "/usr/local/cuda/targets/x86_64-linux/lib",
+            "/usr/local/cuda/lib",
+            "/usr/local/lib",
+        ]
+        .iter()
+        .find(|p| std::path::Path::new(p).join("libcuobjserver.so").exists())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "/usr/lib/x86_64-linux-gnu".into());
 
         println!(
             "cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,{}",

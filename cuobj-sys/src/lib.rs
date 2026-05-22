@@ -70,6 +70,10 @@ pub const CU_OBJ_SUCCESS: i32 = 0;
 #[cfg(any(feature = "client", feature = "server"))]
 pub const CUOBJ_PROTO_RDMA_DC_V1: i32 = 1001;
 
+/// Maximum scatter/gather entries supported by the cuObj server API.
+#[cfg(feature = "server")]
+pub const CUOBJ_MAX_SGE: usize = 10;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // cuObjClient FFI (wrapper.cpp → libcuobjclient.so)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -293,6 +297,20 @@ unsafe impl Send for CuObjAsyncEvent {}
 #[cfg(feature = "server")]
 unsafe impl Sync for CuObjAsyncEvent {}
 
+/// Rust-compatible mirror of `cuObjScatterGatherEntryWithOffset_t`.
+///
+/// Used with `cuObjServer::getRDMABufferFromSgList` to derive an RDMA buffer
+/// from offset/size regions in an already registered base buffer.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct CuObjScatterGatherEntryWithOffset {
+    /// Offset in bytes from the start of the registered base buffer.
+    pub offset: i64,
+    /// Number of bytes in this scatter/gather entry.
+    pub size: usize,
+}
+
 #[cfg(feature = "server")]
 extern "C" {
     /// Create a `cuObjServer` bound to the given RDMA NIC `ip` and `port`.
@@ -345,6 +363,25 @@ extern "C" {
     /// Return the allocated size in bytes of a `CuObjSrvBuffer`.
     pub fn cuobj_srv_buf_size(buf: *mut c_void) -> usize;
 
+    /// Return the raw `rdma_buffer*` inside a `CuObjSrvBuffer`.
+    pub fn cuobj_srv_buf_rbuf(buf: *mut c_void) -> *mut c_void;
+
+    /// Create a derived scatter/gather RDMA buffer from an existing registered
+    /// base `rdma_buffer*`.
+    ///
+    /// The returned handle must be released with
+    /// [`cuobj_srv_put_rdma_buffer_from_sg_list`].
+    pub fn cuobj_srv_get_rdma_buffer_from_sg_list(
+        handle: *mut c_void,
+        base_rbuf: *mut c_void,
+        entries: *const CuObjScatterGatherEntryWithOffset,
+        len: usize,
+    ) -> *mut c_void;
+
+    /// Release a derived scatter/gather RDMA buffer returned by
+    /// [`cuobj_srv_get_rdma_buffer_from_sg_list`].
+    pub fn cuobj_srv_put_rdma_buffer_from_sg_list(handle: *mut c_void, sg_rbuf: *mut c_void);
+
     /// Handle an S3 PUT: RDMA_READ from the client's buffer into the server's
     /// local `buf` (`cuObjServer::handlePutObject`).
     ///
@@ -359,6 +396,21 @@ extern "C" {
         handle: *mut c_void,
         key: *const c_char,
         buf: *mut c_void,
+        remote_buf_start: u64,
+        size: usize,
+        rdma_descr: *const c_char,
+        channel: u16,
+        status: *mut ibv_wc_status,
+    ) -> isize;
+
+    /// Handle an S3 PUT using a raw `rdma_buffer*`.
+    ///
+    /// Intended for scatter/gather buffers returned by
+    /// [`cuobj_srv_get_rdma_buffer_from_sg_list`].
+    pub fn cuobj_srv_handle_put_rbuf(
+        handle: *mut c_void,
+        key: *const c_char,
+        rbuf: *mut c_void,
         remote_buf_start: u64,
         size: usize,
         rdma_descr: *const c_char,
@@ -386,6 +438,21 @@ extern "C" {
         status: *mut ibv_wc_status,
     ) -> isize;
 
+    /// Handle an S3 GET using a raw `rdma_buffer*`.
+    ///
+    /// Intended for scatter/gather buffers returned by
+    /// [`cuobj_srv_get_rdma_buffer_from_sg_list`].
+    pub fn cuobj_srv_handle_get_rbuf(
+        handle: *mut c_void,
+        key: *const c_char,
+        rbuf: *mut c_void,
+        remote_buf_start: u64,
+        size: usize,
+        rdma_descr: *const c_char,
+        channel: u16,
+        status: *mut ibv_wc_status,
+    ) -> isize;
+
     /// Submit an async S3 PUT (`cuObjServer::handlePutObject` with non-NULL
     /// `async_handle`).  Returns 0 on successful submission or -1 on failure.
     /// Call [`cuobj_srv_poll`] on the same channel to harvest completions.
@@ -400,6 +467,18 @@ extern "C" {
         async_handle: *mut c_void,
     ) -> isize;
 
+    /// Submit an async S3 PUT using a raw `rdma_buffer*`.
+    pub fn cuobj_srv_handle_put_rbuf_async(
+        handle: *mut c_void,
+        key: *const c_char,
+        rbuf: *mut c_void,
+        remote_buf_start: u64,
+        size: usize,
+        rdma_descr: *const c_char,
+        channel: u16,
+        async_handle: *mut c_void,
+    ) -> isize;
+
     /// Submit an async S3 GET (`cuObjServer::handleGetObject` with non-NULL
     /// `async_handle`).  Returns 0 on successful submission or -1 on failure.
     /// Call [`cuobj_srv_poll`] on the same channel to harvest completions.
@@ -407,6 +486,18 @@ extern "C" {
         handle: *mut c_void,
         key: *const c_char,
         buf: *mut c_void,
+        remote_buf_start: u64,
+        size: usize,
+        rdma_descr: *const c_char,
+        channel: u16,
+        async_handle: *mut c_void,
+    ) -> isize;
+
+    /// Submit an async S3 GET using a raw `rdma_buffer*`.
+    pub fn cuobj_srv_handle_get_rbuf_async(
+        handle: *mut c_void,
+        key: *const c_char,
+        rbuf: *mut c_void,
         remote_buf_start: u64,
         size: usize,
         rdma_descr: *const c_char,

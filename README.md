@@ -69,7 +69,7 @@ The build locates the cuObj headers and shared libraries via:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CUOBJ_ROOT_DIR` | See below | Override SDK root (headers + client lib) |
+| `CUOBJ_ROOT_DIR` | See below | Override SDK root (headers + SDK libs) |
 | `CUOBJ_LIB_DIR` | — | Override library search path for `libcuobjclient.so` |
 
 When `CUOBJ_ROOT_DIR` is not set, the build searches these paths in order:
@@ -78,7 +78,7 @@ When `CUOBJ_ROOT_DIR` is not set, the build searches these paths in order:
 2. `/usr/local/cuda/targets/x86_64-linux`
 3. `/usr/local/cuda`
 
-`libcuobjserver.so` is searched in `/usr/lib/x86_64-linux-gnu`, `/usr/lib`, and `/usr/local/lib`.
+`libcuobjserver.so` is searched in `/usr/lib/x86_64-linux-gnu`, `/usr/lib`, the CUDA SDK library directories above, and finally `/usr/local/lib`.
 
 ### Runtime library paths
 
@@ -89,10 +89,9 @@ Builds produced after the addition of RPATH embedding (see `build.rs`) do not ne
 export LD_LIBRARY_PATH=/usr/local/cuda-13.2/targets/x86_64-linux/lib
 ```
 
-The server links both `libcuobjserver.so` and `libcuobjclient.so`; only the
-latter requires the extra search path (it ships with the CUDA SDK, not the OS).
-The system `libcuobjserver.so` in `/lib/x86_64-linux-gnu` is on the default
-linker search path and does not need an override.
+The server may link both `libcuobjserver.so` and `libcuobjclient.so` from the
+CUDA SDK library directory.  If your installation provides `libcuobjserver.so`
+from a system library path, that path is preferred before the SDK fallback.
 
 **Note:** `/usr/local/lib` may contain manually-installed cuObj builds that are
 incompatible with the running glibc (observed as a glibc `malloc` assertion
@@ -239,6 +238,7 @@ If you see an error about missing `libcuobjclient.so.1`, see the
 | `send_get(key, offset, data, token)` | RDMA_WRITE `data` → client memory |
 | `alloc_buffer(size)` | Allocate RDMA-registered host buffer (low-level) |
 | `alloc_channel()` | Allocate a channel ID for one concurrent transfer (low-level) |
+| `scatter_gather_buffer(base, entries)` | Create a derived SG RDMA buffer over ranges in an `AllocatedBuffer` |
 | `handle_put(key, buf, offset, size, token, channel)` | Low-level RDMA_READ |
 | `handle_get(key, buf, offset, size, token, channel)` | Low-level RDMA_WRITE |
 | `free_channel_by_id(id)` | Free a channel whose `Channel` guard was leaked |
@@ -249,12 +249,21 @@ If you see an error about missing `libcuobjclient.so.1`, see the
 | Method | Description |
 |---|---|
 | `PersistentBuffer::new(server, size)` | Allocate and register; buffer lives until dropped |
+| `scatter_gather(entries)` | Create a derived SG RDMA buffer over ranges in this buffer |
 | `handle_put(key, offset, size, token, channel_id)` | RDMA_READ into this buffer |
 | `handle_get(key, offset, size, token, channel_id)` | RDMA_WRITE from this buffer |
 | `submit_put_async(...)` | Submit async RDMA_READ (`unsafe`) |
 | `submit_get_async(...)` | Submit async RDMA_WRITE (`unsafe`) |
 | `as_slice()` / `as_mut_slice()` | View buffer contents |
 | `Deref<[u8]>` / `DerefMut` | Slice indexing |
+
+**`ScatterGatherBuffer`** (derived from an existing server buffer):
+
+| Method | Description |
+|---|---|
+| `handle_put(key, remote_offset, token, channel_id)` | RDMA_READ into SG ranges |
+| `handle_get(key, remote_offset, token, channel_id)` | RDMA_WRITE from SG ranges |
+| `submit_put_async(...)` / `submit_get_async(...)` | Submit async SG transfers (`unsafe`) |
 
 ## License
 

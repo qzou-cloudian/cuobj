@@ -254,7 +254,7 @@ mod server {
 #[cfg(all(feature = "client", feature = "server"))]
 mod roundtrip {
     use super::rdma_ip;
-    use cuobj::{CuObjClient, CuObjServer};
+    use cuobj::{CuObjClient, CuObjServer, ScatterGatherEntry};
 
     #[test]
     #[ignore = "requires RDMA hardware with loopback support"]
@@ -303,5 +303,95 @@ mod roundtrip {
             .expect("send_get");
 
         assert_eq!(&pong[..4], b"pong", "GET: unexpected payload");
+    }
+
+    #[test]
+    #[ignore = "requires RDMA hardware with loopback support"]
+    fn put_scatter_gather_roundtrip() {
+        let ip = rdma_ip();
+        let server = CuObjServer::new(&ip, 4449).expect("CuObjServer::new");
+        assert!(server.is_connected());
+
+        let client = CuObjClient::new().expect("CuObjClient::new");
+        assert!(client.is_connected());
+
+        let mut source = vec![0u8; 4096];
+        source[..8].copy_from_slice(b"abcdefgh");
+
+        let reg = client
+            .register_buffer(source.as_mut_ptr(), source.len())
+            .expect("register_buffer");
+        let token = reg.put_token(0, 8).expect("put_token");
+
+        let mut local = server.alloc_buffer(4096).expect("alloc_buffer");
+        local.as_mut_slice().fill(0xCD);
+        let sg = server
+            .scatter_gather_buffer(
+                &local,
+                &[
+                    ScatterGatherEntry {
+                        offset: 128,
+                        size: 4,
+                    },
+                    ScatterGatherEntry {
+                        offset: 512,
+                        size: 4,
+                    },
+                ],
+            )
+            .expect("scatter_gather_buffer");
+
+        let n = sg
+            .handle_put("test/put-sg", 0, token.as_str(), None)
+            .expect("handle_put sg");
+
+        assert_eq!(n, 8);
+        assert_eq!(&local.as_slice()[128..132], b"abcd");
+        assert_eq!(&local.as_slice()[512..516], b"efgh");
+        assert_eq!(local.as_slice()[0], 0xCD);
+    }
+
+    #[test]
+    #[ignore = "requires RDMA hardware with loopback support"]
+    fn get_scatter_gather_roundtrip() {
+        let ip = rdma_ip();
+        let server = CuObjServer::new(&ip, 4450).expect("CuObjServer::new");
+        assert!(server.is_connected());
+
+        let client = CuObjClient::new().expect("CuObjClient::new");
+        assert!(client.is_connected());
+
+        let mut destination = vec![0u8; 4096];
+        let reg = client
+            .register_buffer(destination.as_mut_ptr(), destination.len())
+            .expect("register_buffer");
+        let token = reg.get_token(0, 8).expect("get_token");
+
+        let mut local = server.alloc_buffer(4096).expect("alloc_buffer");
+        local.as_mut_slice().fill(0);
+        local.as_mut_slice()[64..68].copy_from_slice(b"pong");
+        local.as_mut_slice()[256..260].copy_from_slice(b"data");
+        let sg = server
+            .scatter_gather_buffer(
+                &local,
+                &[
+                    ScatterGatherEntry {
+                        offset: 64,
+                        size: 4,
+                    },
+                    ScatterGatherEntry {
+                        offset: 256,
+                        size: 4,
+                    },
+                ],
+            )
+            .expect("scatter_gather_buffer");
+
+        let n = sg
+            .handle_get("test/get-sg", 0, token.as_str(), None)
+            .expect("handle_get sg");
+
+        assert_eq!(n, 8);
+        assert_eq!(&destination[..8], b"pongdata");
     }
 }

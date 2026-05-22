@@ -17,6 +17,7 @@
 
 #include <cuobjserver.h>   // /usr/include (system path)
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -46,6 +47,12 @@ struct CuObjSrvBuffer {
     void              *host_ptr; ///< Aligned host memory (free with ::free())
     struct rdma_buffer *rbuf;    ///< RDMA-registered handle
     size_t             size;     ///< Allocation size in bytes
+};
+
+/** C ABI mirror of cuObjScatterGatherEntryWithOffset_t. */
+struct CuObjSrvScatterGatherEntryWithOffset {
+    int64_t offset;
+    size_t  size;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +204,52 @@ size_t cuobj_srv_buf_size(void *buf_handle)
     return buf ? buf->size : 0;
 }
 
+/** Return the raw rdma_buffer* inside a CuObjSrvBuffer. */
+void *cuobj_srv_buf_rbuf(void *buf_handle)
+{
+    CuObjSrvBuffer *buf = static_cast<CuObjSrvBuffer *>(buf_handle);
+    return buf ? static_cast<void *>(buf->rbuf) : nullptr;
+}
+
+/**
+ * Create a derived RDMA buffer from scatter/gather offsets into an existing
+ * registered RDMA buffer.
+ *
+ * Caller must release the returned handle with
+ * cuobj_srv_put_rdma_buffer_from_sg_list().
+ */
+void *cuobj_srv_get_rdma_buffer_from_sg_list(
+    void                                      *handle,
+    void                                      *base_rbuf,
+    const CuObjSrvScatterGatherEntryWithOffset *entries,
+    size_t                                     len)
+{
+    if (!handle || !base_rbuf || !entries || len == 0) return nullptr;
+
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    std::vector<cuObjScatterGatherEntryWithOffset_t> sglist;
+    sglist.reserve(len);
+
+    for (size_t i = 0; i < len; ++i) {
+        cuObjScatterGatherEntryWithOffset_t entry;
+        entry.offset = static_cast<loff_t>(entries[i].offset);
+        entry.size = entries[i].size;
+        sglist.push_back(entry);
+    }
+
+    return static_cast<void *>(h->server->getRDMABufferFromSgList(
+        static_cast<struct rdma_buffer *>(base_rbuf),
+        sglist));
+}
+
+/** Release a derived scatter/gather RDMA buffer. */
+void cuobj_srv_put_rdma_buffer_from_sg_list(void *handle, void *sg_rbuf)
+{
+    if (!handle || !sg_rbuf) return;
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    h->server->putRDMABufferFromSgList(static_cast<struct rdma_buffer *>(sg_rbuf));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RDMA transfers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,6 +293,37 @@ ssize_t cuobj_srv_handle_put(
 }
 
 /**
+ * Handle an S3 PUT using a raw rdma_buffer*.
+ *
+ * This is used for derived scatter/gather RDMA buffers returned by
+ * getRDMABufferFromSgList().
+ */
+ssize_t cuobj_srv_handle_put_rbuf(
+    void       *handle,
+    const char *key,
+    void       *rbuf,
+    uint64_t    remote_buf_start,
+    size_t      size,
+    const char *rdma_descr,
+    uint16_t    channel,
+    int        *status)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    ibv_wc_status wc_status = IBV_WC_SUCCESS;
+    ssize_t n = h->server->handlePutObject(
+        std::string(key),
+        static_cast<struct rdma_buffer *>(rbuf),
+        remote_buf_start,
+        size,
+        std::string(rdma_descr),
+        channel,
+        /*local_offset=*/0,
+        &wc_status);
+    if (status) *status = static_cast<int>(wc_status);
+    return n;
+}
+
+/**
  * Submit an async S3 PUT (RDMA_READ) on the given channel.
  *
  * `async_handle` must be non-NULL; the caller identifies its in-flight request
@@ -262,6 +346,32 @@ ssize_t cuobj_srv_handle_put_async(
     return h->server->handlePutObject(
         std::string(key),
         buf->rbuf,
+        remote_buf_start,
+        size,
+        std::string(rdma_descr),
+        channel,
+        /*local_offset=*/0,
+        /*status=*/nullptr,
+        async_handle);
+}
+
+/**
+ * Submit an async S3 PUT using a raw rdma_buffer*.
+ */
+ssize_t cuobj_srv_handle_put_rbuf_async(
+    void       *handle,
+    const char *key,
+    void       *rbuf,
+    uint64_t    remote_buf_start,
+    size_t      size,
+    const char *rdma_descr,
+    uint16_t    channel,
+    void       *async_handle)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    return h->server->handlePutObject(
+        std::string(key),
+        static_cast<struct rdma_buffer *>(rbuf),
         remote_buf_start,
         size,
         std::string(rdma_descr),
@@ -308,6 +418,37 @@ ssize_t cuobj_srv_handle_get(
 }
 
 /**
+ * Handle an S3 GET using a raw rdma_buffer*.
+ *
+ * This is used for derived scatter/gather RDMA buffers returned by
+ * getRDMABufferFromSgList().
+ */
+ssize_t cuobj_srv_handle_get_rbuf(
+    void       *handle,
+    const char *key,
+    void       *rbuf,
+    uint64_t    remote_buf_start,
+    size_t      size,
+    const char *rdma_descr,
+    uint16_t    channel,
+    int        *status)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    ibv_wc_status wc_status = IBV_WC_SUCCESS;
+    ssize_t n = h->server->handleGetObject(
+        std::string(key),
+        static_cast<struct rdma_buffer *>(rbuf),
+        remote_buf_start,
+        size,
+        std::string(rdma_descr),
+        channel,
+        /*local_offset=*/0,
+        &wc_status);
+    if (status) *status = static_cast<int>(wc_status);
+    return n;
+}
+
+/**
  * Submit an async S3 GET (RDMA_WRITE) on the given channel.
  *
  * Populate `buf_handle`'s host_ptr with the object data before calling.
@@ -330,6 +471,32 @@ ssize_t cuobj_srv_handle_get_async(
     return h->server->handleGetObject(
         std::string(key),
         buf->rbuf,
+        remote_buf_start,
+        size,
+        std::string(rdma_descr),
+        channel,
+        /*local_offset=*/0,
+        /*status=*/nullptr,
+        async_handle);
+}
+
+/**
+ * Submit an async S3 GET using a raw rdma_buffer*.
+ */
+ssize_t cuobj_srv_handle_get_rbuf_async(
+    void       *handle,
+    const char *key,
+    void       *rbuf,
+    uint64_t    remote_buf_start,
+    size_t      size,
+    const char *rdma_descr,
+    uint16_t    channel,
+    void       *async_handle)
+{
+    CuObjSrvHandle *h = static_cast<CuObjSrvHandle *>(handle);
+    return h->server->handleGetObject(
+        std::string(key),
+        static_cast<struct rdma_buffer *>(rbuf),
         remote_buf_start,
         size,
         std::string(rdma_descr),
